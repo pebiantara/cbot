@@ -124,6 +124,7 @@ import queue
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -781,19 +782,43 @@ def quick_scalp_levels(anchor_price, is_long, leverage, symbol=None):
     return levels
 
 
+SCAN_WORKER_COUNT = 8  # see scan_quick_scalp_signals' docstring
+
+
 def scan_quick_scalp_signals(symbols=None, top_n=QUICK_SCALP_TOP_N):
     """{symbol: signal_dict} for every symbol with a confirmed rolling-delta
     trigger right now. Mirrors scalp_pattern_signal.py's
-    scan_scalp_signals in shape."""
+    scan_scalp_signals in shape.
+
+    Parallelized 2026-11-13 -- found that a full SEQUENTIAL scan across
+    the (now ~60-symbol, grown from the $10M->$5M universe-widening
+    change) universe was legitimately taking 600-2000+ seconds end to
+    end, repeatedly tripping quick_scalp_alert.py's process-level
+    watchdog even though no single symbol was individually stuck (the
+    per-symbol timeout below never fired during the slow cycles that
+    were measured) -- it was accumulated per-symbol latency, not a hang.
+    Each symbol's work is I/O-bound (waiting on HTTP calls), so a thread
+    pool gives a real wall-clock speedup despite the GIL (it releases
+    during I/O wait). SCAN_WORKER_COUNT=8 is a first-guess balance
+    between speed and not tripping Binance's rate limits (429s were seen
+    earlier this same project at higher concurrency/burst rates) --
+    not yet tuned against real measurements, revisit if 429s show up in
+    logs."""
     if symbols is None:
         symbols = [s for s in _resolve_symbols(top_n) if s not in QUICK_SCALP_EXCLUDED_SYMBOLS]
 
     signals = {}
-    for symbol in symbols:
-        signal = _scan_one_symbol_with_timeout(symbol)
-        if signal is not None:
-            signals[symbol] = signal
-        time.sleep(0.05)
+    with ThreadPoolExecutor(max_workers=SCAN_WORKER_COUNT) as pool:
+        futures = {pool.submit(_scan_one_symbol_with_timeout, symbol): symbol for symbol in symbols}
+        for future in as_completed(futures):
+            symbol = futures[future]
+            try:
+                signal = future.result()
+            except Exception as e:
+                print(f"[scan] {symbol} pool task raised {e} -- skipping", flush=True)
+                continue
+            if signal is not None:
+                signals[symbol] = signal
     return signals
 
 
