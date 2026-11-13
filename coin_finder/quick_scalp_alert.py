@@ -37,6 +37,7 @@ through one poll and exit (useful for testing).
 
 import json
 import os
+import threading
 import time
 
 from orderbook_snapshot import log_snapshot as log_orderbook_snapshot
@@ -187,10 +188,40 @@ def poll_once_all():
             print(f"[PRO shadow] poll failed: {e} -- continuing")
 
 
+MAX_POLL_SECONDS = int(os.environ.get("QUICK_SCALP_MAX_POLL_SECONDS", 600))
+_watchdog_state = {"poll_started_at": time.time()}
+
+
+def _watchdog():
+    """Added 2026-11-13 after repeated real incidents where a poll cycle
+    ran far longer than expected (many individually-bounded retried
+    calls across ~60 symbols stacking up under bad network conditions --
+    see cbot_technical_gotchas.md #15) and needed a MANUAL restart,
+    sometimes several in a row, to recover. This makes recovery fully
+    automatic: if a cycle ever runs longer than MAX_POLL_SECONDS (600s --
+    generous enough that a legitimately slow-but-working cycle won't get
+    killed, confirmed one real cycle took ~10min end to end), force-exit
+    the whole process. `restart: unless-stopped` in docker-compose.yml
+    brings it back up within seconds -- no human needs to notice or act.
+    os._exit() (not sys.exit()) because this must work even if the main
+    thread is blocked inside a C-level socket call that won't respond to
+    a normal exception."""
+    while True:
+        time.sleep(15)
+        elapsed = time.time() - _watchdog_state["poll_started_at"]
+        if elapsed > MAX_POLL_SECONDS:
+            print(f"[watchdog] poll cycle running for {elapsed:.0f}s (limit {MAX_POLL_SECONDS}s) "
+                  f"-- force-exiting so Docker restarts cleanly", flush=True)
+            os._exit(1)
+
+
 if __name__ == "__main__":
+    threading.Thread(target=_watchdog, daemon=True).start()
+    _watchdog_state["poll_started_at"] = time.time()
     poll_once_all()
     if os.environ.get("RUN_ONCE"):
         raise SystemExit(0)
     while True:
         time.sleep(POLL_INTERVAL_SECONDS)
+        _watchdog_state["poll_started_at"] = time.time()
         poll_once_all()  # isolates/logs its own failures, never raises

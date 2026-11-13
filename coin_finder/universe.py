@@ -1,6 +1,8 @@
 """Binance USDT spot universe: pairs with enough 24h volume to trade without slippage."""
 
 import json
+import time
+import urllib.error
 import urllib.request
 
 BINANCE_API = "https://api.binance.com"
@@ -32,10 +34,28 @@ COMMODITY_PEGGED_SYMBOLS = {"XAUT", "PAXG"}
 _non_crypto_symbols_cache = None
 
 
+# Retries transient network errors before giving up -- added 2026-11-13,
+# this function was the one real gap found while chasing a quick-scalp-
+# alert slowdown: history.py's _get() got the same retry fix 2026-11-12,
+# this one (used only by get_universe(), called once per scan cycle) was
+# missed. A single unretried blip here used to fail the whole cycle
+# immediately with no recovery attempt.
+_GET_RETRIES = 3
+_GET_RETRY_BACKOFF_SECONDS = 0.5
+
+
 def _get(path, base=BINANCE_API):
     url = f"{base}{path}"
-    with urllib.request.urlopen(url, timeout=15) as resp:
-        return json.loads(resp.read())
+    last_error = None
+    for attempt in range(_GET_RETRIES):
+        try:
+            with urllib.request.urlopen(url, timeout=15) as resp:
+                return json.loads(resp.read())
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+            last_error = e
+            if attempt < _GET_RETRIES - 1:
+                time.sleep(_GET_RETRY_BACKOFF_SECONDS * (attempt + 1))
+    raise last_error
 
 
 def get_non_crypto_symbols():
