@@ -1,0 +1,81 @@
+---
+# System 1 (freqtrade trading bot + its pipeline/binance-whale-listener/
+# dashboard/cloudflared-dashboard support infra), the breakout/reversal
+# engine (scalp_pattern_signal.py / scalp-pattern-alert / `/fut_`, what the
+# project's own memory calls "System 3" by build order), and
+# futures-liquidation-listener (only consumer was that engine + System 2)
+# are all removed as of 2026-11-11, at the user's request -- trading is
+# now ONLY off the fade engine (quick_scalp_signal.py / quick-scalp-alert /
+# `/scalp_`), which the user calls "System 3" in their own usage. NOTE THE
+# TERMINOLOGY MISMATCH: don't assume "System 3" means scalp_pattern_signal.py
+# just because older memory/code comments say so -- confirm with the user
+# if ambiguous. Code files for everything removed are untouched (user_data/,
+# pipeline/, coin_finder/scalp_pattern_signal.py, coin_finder/dashboard.py,
+# etc.) in case any of this ever needs to come back -- just re-add the
+# service block (no git in this project -- keep a copy of this comment's
+# removed content elsewhere if a restore is ever needed).
+services:
+  quick-scalp-alert:
+    build: .
+    container_name: cbot-quick-scalp-alert
+    restart: unless-stopped
+    working_dir: /app/coin_finder
+    volumes:
+      - "./coin_finder:/app/coin_finder"
+      - "./.env:/app/.env:ro"
+    environment:
+      - PYTHONUNBUFFERED=1
+    command: python quick_scalp_alert.py
+
+  # scalp-early-warning removed 2026-11-06 at the user's request -- alerts
+  # should come from the fade engine's confirmed/ready-to-trade signal only.
+  # scalp_early_warning.py itself is untouched (coin_finder/) in case this
+  # ever needs to come back.
+
+  webhook-server:
+    build: .
+    container_name: cbot-webhook-server
+    restart: unless-stopped
+    working_dir: /app/whale_scanner
+    volumes:
+      - "./coin_finder:/app/coin_finder"
+      - "./whale_scanner:/app/whale_scanner"
+      - "./.env:/app/.env:ro"
+    environment:
+      - PYTHONUNBUFFERED=1
+    ports:
+      - "127.0.0.1:8090:8090"
+    command: python -m uvicorn webhook_server:app --host 0.0.0.0 --port 8090
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: cbot-cloudflared
+    restart: unless-stopped
+    depends_on:
+      - webhook-server
+    # Quick Tunnel: free, no Cloudflare account/domain needed. Downside: the
+    # public *.trycloudflare.com URL is random and changes on every restart --
+    # webhook-registrar watches this container's logs (via the Docker Engine
+    # API) and auto-registers the new URL, so this doesn't need to be done by
+    # hand. (cloudflared's image is fully distroless -- no shell at all -- so
+    # redirecting its own output to a shared file isn't an option here.)
+    command: tunnel --no-autoupdate --url http://webhook-server:8090
+
+  webhook-registrar:
+    build: .
+    container_name: cbot-webhook-registrar
+    restart: unless-stopped
+    working_dir: /app/whale_scanner
+    depends_on:
+      - cloudflared
+    volumes:
+      - "./coin_finder:/app/coin_finder"
+      - "./whale_scanner:/app/whale_scanner"
+      - "./.env:/app/.env:ro"
+      # read-only: lets watch_tunnel.py read cloudflared's logs via the Docker
+      # Engine API, without installing the docker CLI or giving it any other
+      # control over containers.
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+    environment:
+      - PYTHONUNBUFFERED=1
+    command: python watch_tunnel.py

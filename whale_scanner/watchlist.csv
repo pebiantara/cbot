@@ -1,0 +1,7 @@
+chain,address,label,is_exchange,source
+ethereum,0x28C6c06298d514Db089934071355E5743bf21d60,Binance 14 (exchange hot wallet),true,https://etherscan.io/address/0x28c6c06298d514db089934071355e5743bf21d60
+arbitrum,0x28C6c06298d514Db089934071355E5743bf21d60,Binance 14 (exchange hot wallet),true,https://etherscan.io/address/0x28c6c06298d514db089934071355e5743bf21d60
+bsc,0x28C6c06298d514Db089934071355E5743bf21d60,Binance 14 (exchange hot wallet),true,https://etherscan.io/address/0x28c6c06298d514db089934071355e5743bf21d60
+base,0x28C6c06298d514Db089934071355E5743bf21d60,Binance 14 (exchange hot wallet),true,https://etherscan.io/address/0x28c6c06298d514db089934071355e5743bf21d60
+ethereum,0xAb5801a7D398351b8bE11C439e05C5B3259aeC9b,vitalik.eth,false,https://etherscan.io/address/0xab5801a7d398351b8be11c439e05c5b3259aec9b
+solana,5tzFkiKscXHK5ZXCGbXZxdw7gTjjD1mBwuoFbhUvuAi9,Binance 2 (exchange hot wallet),true,https://solscan.io/account/5tzFkiKscXHK5ZXCGbXZxdw7gTjjD1mBwuoFbhUvuAi9

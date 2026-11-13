@@ -1,0 +1,37 @@
+.env
+user_data/logs/
+user_data/data/
+user_data/backtest_results/
+user_data/hyperopt_results/
+user_data/notebooks/.ipynb_checkpoints/
+user_data/tradesv3*.sqlite*
+user_data/freqaimodels/
+user_data/config.json
+*.pyc
+__pycache__/
+.DS_Store
+.venv/
+.vscode/
+.claude/
+
+# Runtime-generated state, databases, and outputs -- regenerated on
+# startup/each run, not meant to be versioned. Curated config data
+# (watchlist.csv, token_map.csv) is intentionally NOT listed here.
+*.db
+*_state.json
+dashboard_url.json
+portfolio_ledger.json
+green_list.json
+green_list_prev.json
+technical_scores.csv
+whale_scores.csv
+ml_scores.csv
+accuracy_report.json
+
+# Bulk downloaded market data and trained-model artifacts -- large,
+# regeneratable from the scripts that produce them, not source.
+coin_finder/data/
+user_data/models/
+*.feather
+*.pkl
+*.joblib
