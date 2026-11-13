@@ -120,7 +120,9 @@ re-check real outcomes once enough post-flip signals accumulate.
 
 import datetime
 import os
+import queue
 import sys
+import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -788,14 +790,56 @@ def scan_quick_scalp_signals(symbols=None, top_n=QUICK_SCALP_TOP_N):
 
     signals = {}
     for symbol in symbols:
+        signal = _scan_one_symbol_with_timeout(symbol)
+        if signal is not None:
+            signals[symbol] = signal
+        time.sleep(0.05)
+    return signals
+
+
+PER_SYMBOL_SCAN_TIMEOUT_SECONDS = 90  # see _scan_one_symbol_with_timeout
+
+
+def _scan_one_symbol(symbol, result_box):
+    """Runs in a worker thread -- see _scan_one_symbol_with_timeout."""
+    try:
         mid_trend = mid_period_trend(symbol)
         signal = detect_quick_signal(symbol, mid_trend)
         if signal is not None:
             signal["close_price"] = fetch_live_futures_price(symbol)
             signal["mid_trend"] = mid_trend
-            signals[symbol] = signal
-        time.sleep(0.05)
-    return signals
+        result_box.put(signal)
+    except Exception as e:
+        print(f"[scan] {symbol} raised {e} -- skipping", flush=True)
+        result_box.put(None)
+
+
+def _scan_one_symbol_with_timeout(symbol, timeout=PER_SYMBOL_SCAN_TIMEOUT_SECONDS):
+    """Added 2026-11-13 after a real incident: a single symbol's call
+    chain (mid_period_trend/detect_quick_signal) hung for 615+ seconds --
+    far beyond any bounded retry chain, a genuine stuck call somewhere
+    (exact line not pinned down) -- and froze the ENTIRE scan, costing
+    the whole poll cycle rather than just that one symbol. A thread-based
+    timeout is the standard cross-platform-safe way to bound an arbitrary
+    blocking call in Python (signal.alarm doesn't play well with threads
+    and isn't available everywhere); the stuck thread itself is
+    abandoned (daemon=True, left running harmlessly in the background --
+    Python has no safe way to force-kill a thread) while the scan moves
+    on to the next symbol within `timeout` seconds instead of losing the
+    whole cycle. The process-level watchdog in quick_scalp_alert.py stays
+    as a second line of defense in case this mechanism itself ever has a
+    gap, not removed -- defense in depth, not a replacement."""
+    result_box = queue.Queue(maxsize=1)
+    t = threading.Thread(target=_scan_one_symbol, args=(symbol, result_box), daemon=True)
+    t.start()
+    t.join(timeout=timeout)
+    if t.is_alive():
+        print(f"[scan] {symbol}: no response after {timeout}s -- skipping, moving to next coin", flush=True)
+        return None
+    try:
+        return result_box.get_nowait()
+    except queue.Empty:
+        return None
 
 
 def scan_quick_scalp_signals_pro(symbols=None, top_n=QUICK_SCALP_TOP_N):
