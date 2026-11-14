@@ -17,8 +17,20 @@ RIBBON_PERIODS = (5, 8, 13)
 def ribbon_direction(candles, periods=RIBBON_PERIODS):
     """"bullish" if the fast/mid/slow EMAs are fanned in bullish order
     (fast > mid > slow), "bearish" if fanned bearish, None if tangled/not
-    fanned at all (no clean momentum read)."""
-    closes = [c["close"] for c in candles]
+    fanned at all (no clean momentum read).
+
+    Excludes the still-forming current candle (added 2026-11-14) --
+    found a real live case where this flipped PASS->FAIL within 60
+    seconds of a 15m candle boundary, because a brand-new candle's
+    close is essentially just its open print for the first stretch of
+    its life, and EMA5 (shortest period = most weight on the newest
+    point) swings hard on that noise. Same "don't trust the forming
+    candle" convention already used by candlestick_patterns.py's
+    _quick_candle_confirms (candles[-2], not candles[-1])."""
+    closed = candles[:-1]
+    closes = [c["close"] for c in closed]
+    if not closes:
+        return None
     emas = [ema(closes, p) for p in periods]
     if any(e[-1] is None for e in emas):
         return None
@@ -42,18 +54,23 @@ def vwap(candles):
 
 
 def vwap_distance_pct(candles, lookback=20):
-    """(distance_pct, vwap_value) -- current close's %, distance from the
-    VWAP of the trailing `lookback` candles (current candle excluded from
-    the VWAP calc itself, same "don't let it include itself" convention
-    as candlestick_patterns._recent_avg_volume). Positive = price above
-    VWAP, negative = below. None if not enough data."""
-    if len(candles) < lookback + 1:
+    """(distance_pct, vwap_value) -- the last CLOSED candle's %, distance
+    from the VWAP of the `lookback` closed candles before that. Positive
+    = price above VWAP, negative = below. None if not enough data.
+
+    Excludes the still-forming current candle entirely (added
+    2026-11-14, same fix/reasoning as ribbon_direction above) -- both
+    the VWAP window AND the "current close" being compared against it
+    now anchor to the last real closed candle, not whatever the
+    still-forming one happens to show in its first few seconds."""
+    closed = candles[:-1]
+    if len(closed) < lookback + 1:
         return None, None
-    window = candles[-(lookback + 1):-1]
+    window = closed[-(lookback + 1):-1]
     v = vwap(window)
     if v is None or v <= 0:
         return None, None
-    close = candles[-1]["close"]
+    close = closed[-1]["close"]
     return (close - v) / v * 100, v
 
 
