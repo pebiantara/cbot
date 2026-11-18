@@ -2,7 +2,7 @@
 
 - POST /webhooks/helius  -- Helius "enhanced" webhook (Solana), array of parsed txns.
 - POST /webhooks/alchemy -- Alchemy "Address Activity" webhook (BSC/Base/Ethereum/Arbitrum).
-- POST /telegram/webhook -- Telegram bot commands (/status_accuracy, /list, /coins).
+- POST /telegram/webhook -- Telegram bot commands (/help lists all of them).
 
 Only transfers touching a wallet in watchlist.csv are saved. Run with:
     uvicorn webhook_server:app --host 0.0.0.0 --port 8090
@@ -37,13 +37,17 @@ sys.path.insert(0, os.path.join(os.path.dirname(HERE), "coin_finder"))
 from entry_price import (  # noqa: E402
     STOP_LOSS_PCT, TAKE_PROFIT_PCT, fetch_live_price, format_price, refresh_with_live_price,
 )
+from candlestick_patterns import PATTERN_CHECK_INTERVALS, build_pattern_check_message  # noqa: E402
+from support_resistance import build_support_resistance_message  # noqa: E402
 from futures_pattern_signal import build_pattern_digest_message  # noqa: E402
 from leverage_risk import MAX_PORTFOLIO_ALLOCATION_PCT, build_leverage_digest_message  # noqa: E402
 from morning_report import get_morning_snapshot_time  # noqa: E402
+from news_outcomes import HORIZONS as NEWS_HORIZONS, build_report as build_news_report, resolve_matured as resolve_matured_news  # noqa: E402
 from portfolio_ledger import (  # noqa: E402
     list_open_positions, record_close, record_open, total_committed_margin,
 )
 from quick_scalp_signal import QUICK_SCALP_ALLOWED_LEVERAGES, build_quick_scalp_message  # noqa: E402
+from pattern_watch import DEFAULT_PATTERN_WATCH_INTERVAL, start_pattern_watch, stop_pattern_watch  # noqa: E402
 from quick_scalp_watch import start_watch, stop_watch  # noqa: E402
 from scalp_pattern_signal import DEFAULT_TOP_N, build_scalp_digest_message  # noqa: E402
 from outcomes import get_connection as get_predictions_connection  # noqa: E402
@@ -181,6 +185,30 @@ def handle_status_accuracy():
         parts = [f"{label} n={s['count']} hit={s['hit_rate']:.0%}"
                   for label, s in data["by_label"].items()]
         lines.append(f"{horizon}: " + "  ".join(parts))
+    return "\n".join(lines)
+
+
+def handle_news_accuracy():
+    """news_alert.py has no predicted direction (no sentiment scoring), so
+    this reports MAGNITUDE only -- avg/avg-abs return after a coin got
+    news-flagged, not a hit rate. No baseline/control comparison yet (see
+    news_outcomes.py's module docstring) -- a nonzero number here doesn't
+    by itself prove news causes outsized moves."""
+    try:
+        resolve_matured_news()
+    except Exception as e:
+        print(f"news_outcomes resolve_matured failed: {e} -- continuing")
+
+    report = build_news_report()
+    lines = ["\U0001f4f0 News-alert follow-on price moves (magnitude only, "
+             "no predicted direction -- NOT a hit rate, no baseline comparison yet):"]
+    for horizon in NEWS_HORIZONS:
+        stats = report.get(horizon, {"n": 0})
+        if stats["n"] == 0:
+            lines.append(f"{horizon}: no resolved alerts yet")
+            continue
+        lines.append(f"{horizon}: n={stats['n']} avg_return={stats['avg_return_pct']:+.2f}% "
+                      f"avg_abs_return={stats['avg_abs_return_pct']:.2f}%")
     return "\n".join(lines)
 
 
@@ -477,6 +505,32 @@ async def _run_futures_pattern_symbol_refresh_and_reply(chat_id, bot_token, symb
     send_telegram_message(message, bot_token, chat_id)
 
 
+async def _run_pattern_check_and_reply(chat_id, bot_token, symbol, interval):
+    """/pattern_<symbol>_<interval> -- pure candlestick-pattern diagnostic,
+    no SL/TP/leverage, independent of every trading system above. See
+    candlestick_patterns.py's build_pattern_check_message()."""
+    try:
+        message = await asyncio.get_event_loop().run_in_executor(
+            None, build_pattern_check_message, symbol, interval,
+        )
+    except Exception as e:
+        message = f"Pattern check failed: {e}"
+    send_telegram_message(message, bot_token, chat_id, parse_mode="HTML")
+
+
+async def _run_support_resistance_and_reply(chat_id, bot_token, symbol):
+    """/sr_<symbol> -- support/resistance on 1h and 4h candles, pure
+    diagnostic, independent of every trading system above. See
+    support_resistance.py's build_support_resistance_message()."""
+    try:
+        message = await asyncio.get_event_loop().run_in_executor(
+            None, build_support_resistance_message, symbol,
+        )
+    except Exception as e:
+        message = f"Support/resistance check failed: {e}"
+    send_telegram_message(message, bot_token, chat_id, parse_mode="HTML")
+
+
 async def _run_quick_scalp_and_reply(chat_id, bot_token, symbol, leverage):
     """Quick scalp -- 15m fast momentum signal, one symbol + leverage per
     call, e.g. /scalp_btc_50. See coin_finder/quick_scalp_signal.py.
@@ -549,14 +603,65 @@ FUTURES_SYMBOL_RE = re.compile(r"^/futures_([a-zA-Z]{1,15})$")
 OPEN_POSITION_RE = re.compile(r"^/open_([a-zA-Z]{1,15})_(\d+(?:\.\d+)?)$")
 CLOSE_POSITION_RE = re.compile(r"^/close_([a-zA-Z]{1,15})$")
 # /calc_<price>_<leverage>_<roi_pct> e.g. /calc_0.4787_50_30
+PATTERN_RE = re.compile(r"^/pattern_([a-zA-Z]{1,15})_(" + "|".join(PATTERN_CHECK_INTERVALS) + r")$")
+SR_RE = re.compile(r"^/sr_([a-zA-Z]{1,15})$")
 CALC_RE = re.compile(r"^/calc_(\d+(?:\.\d+)?)_(\d{1,4})_(\d+(?:\.\d+)?)$")
 WATCH_RE = re.compile(r"^/watch_([a-zA-Z]{1,15})$")
 UNWATCH_RE = re.compile(r"^/unwatch_([a-zA-Z]{1,15})$")
+WATCH_PATTERN_RE = re.compile(r"^/watch_pattern_([a-zA-Z]{1,15})(?:_(" + "|".join(PATTERN_CHECK_INTERVALS) + r"))?$")
+UNWATCH_PATTERN_RE = re.compile(r"^/unwatch_pattern_([a-zA-Z]{1,15})$")
+
+def handle_help():
+    """Plain-text command reference -- kept in one place so a new command
+    added above should get a line added here too, same convention as
+    TELEGRAM_COMMANDS itself."""
+    return "\n".join([
+        "Green Coin finder:",
+        "/now -- rescan + recompute GREEN/YELLOW/RED for the whole universe",
+        "/now_<leverage>x -- same, plus SL/TP/liquidation at that leverage (e.g. /now_20x)",
+        "/coins -- live Binance trade scan per coin (~15s)",
+        "/list -- today's actionable LONG/SHORT coins from the morning run",
+        "",
+        "Quick scalp (fade engine, live-traded system):",
+        "/scalp_<symbol>_<leverage> -- 15m fast momentum signal (leverage 50 or 100, e.g. /scalp_btc_50)",
+        "",
+        "System 3 (/fut_, on-demand only -- not currently background-traded):",
+        "/fut_<symbol>_<leverage> -- 1h/4h quick-trade signal, reversal or breakout (e.g. /fut_eth_50)",
+        "/fut_all_<leverage> -- same, across the whole tracked universe",
+        "",
+        "System 2 (/futures_, on-demand only -- not currently background-traded):",
+        "/futures_<leverage> -- full-universe reversal-pattern scan at that leverage",
+        "/futures_<symbol> -- single-symbol reversal-pattern check (e.g. /futures_sol)",
+        "",
+        "Candlestick pattern + support/resistance (on demand):",
+        "/pattern_<symbol>_<interval> -- candlestick pattern check "
+        "(interval: 1m/3m/5m/15m/30m/1h/2h/4h/6h/8h/12h/1d, e.g. /pattern_btc_1h)",
+        "/sr_<symbol> -- 1h/4h support/resistance levels (e.g. /sr_btc)",
+        "",
+        "Alerts -- watch/unwatch a symbol:",
+        "/watch_<symbol> / /unwatch_<symbol> -- price-level watch (e.g. /watch_btc)",
+        "/watch_pattern_<symbol>[_<interval>] / /unwatch_pattern_<symbol> -- "
+        "candlestick pattern watch (default interval 30m, e.g. /watch_pattern_eth_1h)",
+        "",
+        "Position tracking + math:",
+        "/open_<symbol>_<margin_usd> -- log a self-reported open position (e.g. /open_btc_500)",
+        "/close_<symbol> -- close a logged position",
+        "/positions -- list open logged positions",
+        "/calc_<price>_<leverage>_<roi_pct> -- SL/TP price for a given ROI target (e.g. /calc_0.4787_50_30)",
+        "",
+        "Status:",
+        "/status_accuracy -- dashboard link + prediction accuracy by horizon",
+        "/news_accuracy -- avg price move after a coin got news-flagged (magnitude only, no hit rate)",
+        "/help -- this list",
+    ])
+
 
 TELEGRAM_COMMANDS = {
     "/status_accuracy": handle_status_accuracy,
+    "/news_accuracy": handle_news_accuracy,
     "/list": handle_list,
     "/positions": handle_positions,
+    "/help": handle_help,
 }
 
 
@@ -668,6 +773,27 @@ async def telegram_webhook(request: Request):
         send_telegram_message(handle_close(symbol), bot_token, chat_id)
         return {"ok": True}
 
+    pattern_match = PATTERN_RE.match(text)
+    if pattern_match:
+        symbol = f"{pattern_match.group(1).upper()}USDT"
+        interval = pattern_match.group(2)
+        send_telegram_message(
+            f"⏳ Checking {symbol} {interval} candles for a candlestick pattern...",
+            bot_token, chat_id,
+        )
+        asyncio.create_task(_run_pattern_check_and_reply(chat_id, bot_token, symbol, interval))
+        return {"ok": True}
+
+    sr_match = SR_RE.match(text)
+    if sr_match:
+        symbol = f"{sr_match.group(1).upper()}USDT"
+        send_telegram_message(
+            f"⏳ Checking {symbol} 1h/4h candles for support/resistance...",
+            bot_token, chat_id,
+        )
+        asyncio.create_task(_run_support_resistance_and_reply(chat_id, bot_token, symbol))
+        return {"ok": True}
+
     calc_match = CALC_RE.match(text)
     if calc_match:
         price = float(calc_match.group(1))
@@ -686,6 +812,19 @@ async def telegram_webhook(request: Request):
     if unwatch_match:
         symbol = f"{unwatch_match.group(1).upper()}USDT"
         send_telegram_message(stop_watch(symbol), bot_token, chat_id)
+        return {"ok": True}
+
+    watch_pattern_match = WATCH_PATTERN_RE.match(text)
+    if watch_pattern_match:
+        symbol = f"{watch_pattern_match.group(1).upper()}USDT"
+        interval = watch_pattern_match.group(2) or DEFAULT_PATTERN_WATCH_INTERVAL
+        send_telegram_message(start_pattern_watch(symbol, interval), bot_token, chat_id)
+        return {"ok": True}
+
+    unwatch_pattern_match = UNWATCH_PATTERN_RE.match(text)
+    if unwatch_pattern_match:
+        symbol = f"{unwatch_pattern_match.group(1).upper()}USDT"
+        send_telegram_message(stop_pattern_watch(symbol), bot_token, chat_id)
         return {"ok": True}
 
     handler = TELEGRAM_COMMANDS.get(text)

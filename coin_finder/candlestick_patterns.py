@@ -132,6 +132,43 @@ def is_tweezer_top(prev, cur):
     return abs(prev["high"] - cur["high"]) / cur["high"] <= TWEEZER_TOLERANCE_PCT / 100
 
 
+HARAMI_BODY_RATIO_MAX = 0.5  # current candle's body must be at most this fraction of the prior candle's body
+
+
+def _harami_contained(prev, cur):
+    return (
+        min(cur["open"], cur["close"]) >= min(prev["open"], prev["close"])
+        and max(cur["open"], cur["close"]) <= max(prev["open"], prev["close"])
+    )
+
+
+def is_bullish_harami(prev, cur):
+    """Opposite of engulfing: prev candle is a large bearish body, cur
+    candle is a small body fully contained inside it -- the selloff has
+    suddenly lost the momentum to keep making a bigger down-candle.
+    Bullish after a decline."""
+    prev_body = _body(prev)
+    if prev_body <= 0 or prev["close"] >= prev["open"]:
+        return False
+    return _body(cur) <= HARAMI_BODY_RATIO_MAX * prev_body and _harami_contained(prev, cur)
+
+
+def is_bearish_harami(prev, cur):
+    """Prev candle is a large bullish body, cur candle is a small body
+    fully contained inside it. Bearish after a rally."""
+    prev_body = _body(prev)
+    if prev_body <= 0 or prev["close"] <= prev["open"]:
+        return False
+    return _body(cur) <= HARAMI_BODY_RATIO_MAX * prev_body and _harami_contained(prev, cur)
+
+
+def is_harami_cross(prev, cur):
+    """Harami where the contained candle is also a doji -- pure
+    indecision swallowed inside the prior candle's body, a stronger
+    version of the plain harami above."""
+    return (is_bullish_harami(prev, cur) or is_bearish_harami(prev, cur)) and is_doji(cur)
+
+
 PIERCING_CLOSE_INTO_FRACTION = 0.5  # 2nd candle must close at least halfway into the 1st candle's body
 
 
@@ -337,12 +374,18 @@ def full_reversal_lean(candles):
     gate): hammer/inverted-hammer/hanging-man (same two shapes, direction
     decided by prior trend context since hammer/hanging-man share one
     shape and shooting-star/inverted-hammer share the other), engulfing,
-    doji/gravestone/dragonfly, tweezer top/bottom, morning/evening star.
-    Does NOT include the continuation patterns (Three Line Strike, Three
-    Methods, Mat Hold) -- out of scope for a reversal-fade mechanism,
-    skipped for time. Priority order below is deliberate: more specific/
-    rarer shapes checked first so a doji doesn't get miscategorized as a
-    generic hammer, etc."""
+    doji/gravestone/dragonfly, tweezer top/bottom, morning/evening star,
+    harami/harami-cross (added 2026-11-14). Does NOT include the
+    continuation patterns (Three Line Strike, Three Methods, Mat Hold) --
+    out of scope for a reversal-fade mechanism, skipped for time. Also
+    skips gap-dependent patterns (Kicker, Abandoned Baby) and Marubozu --
+    the former barely apply to a 24/7 market that rarely gaps, the latter
+    is more a continuation/conviction read than a reversal one. Priority
+    order below is deliberate: more specific/rarer shapes checked first so
+    a doji doesn't get miscategorized as a generic hammer, etc. -- harami
+    cross in particular must be checked before the plain doji checks,
+    since it's a doji shape too but carries real directional context from
+    the engulfing-prior-candle relationship that a bare doji doesn't."""
     if len(candles) < 2:
         return None
     prev, cur = candles[-2], candles[-1]
@@ -358,6 +401,8 @@ def full_reversal_lean(candles):
         shape, direction = "three white soldiers", "bullish"
     elif len(candles) >= 3 and is_three_black_crows(candles[-3], candles[-2], candles[-1]):
         shape, direction = "three black crows", "bearish"
+    elif is_harami_cross(prev, cur):
+        shape, direction = "harami cross", ("bullish" if is_bullish_harami(prev, cur) else "bearish")
     elif is_dragonfly_doji(cur):
         shape, direction = ("dragonfly doji", "bullish") if prior_decline else ("dragonfly doji", "bearish")
     elif is_gravestone_doji(cur):
@@ -378,6 +423,10 @@ def full_reversal_lean(candles):
         shape, direction = "tweezer bottom", "bullish"
     elif is_tweezer_top(prev, cur):
         shape, direction = "tweezer top", "bearish"
+    elif is_bullish_harami(prev, cur):
+        shape, direction = "bullish harami", "bullish"
+    elif is_bearish_harami(prev, cur):
+        shape, direction = "bearish harami", "bearish"
     elif is_hammer(cur):
         shape, direction = ("hammer", "bullish") if prior_decline else ("hanging man", "bearish")
     elif is_shooting_star(cur):
@@ -390,6 +439,55 @@ def full_reversal_lean(candles):
     volume_confirms = _volume_confirms(candles)
     trend_confirms = prior_decline if direction == "bullish" else prior_rally
     return _finish_lean(shape, direction, candles, volume_confirms, trend_confirms)
+
+
+PATTERN_CHECK_INTERVALS = ("1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d")
+
+
+def build_pattern_check_message(symbol, interval):
+    """On-demand candlestick-pattern lookup for any symbol/interval, e.g.
+    /pattern_xrp_5m. Uses the full 16-pattern cheat-sheet detector
+    (full_reversal_lean), not just the 4-pattern live-gate subset in
+    reversal_lean() -- this is a diagnostic read, not a trading signal, so
+    showing the richer set is more useful than hiding it behind the
+    narrower live gate.
+
+    Excludes the still-forming candle (fetches one extra and drops it via
+    candles[:-1]) -- same convention as everywhere else in this project
+    after the real candle-boundary bug found in ema_ribbon_vwap.py
+    (2026-11-14): a still-forming candle's close is just noise early in
+    its life and would make the pattern read flip randomly."""
+    from history import get_futures_klines
+
+    candles = get_futures_klines(symbol, interval, limit=MIN_CANDLES_NEEDED + 1)
+    closed = candles[:-1]
+    cur = closed[-1]
+    avg_vol = _recent_avg_volume(closed)
+
+    lines = [f"\U0001f56f️ <b>{symbol} {interval} pattern check</b>"]
+    lines.append(f"Last closed candle: O={cur['open']:g} H={cur['high']:g} L={cur['low']:g} C={cur['close']:g}")
+    if avg_vol:
+        lines.append(f"Volume: {cur['volume']:,.0f} ({cur['volume'] / avg_vol:.2f}x the {VOLUME_LOOKBACK}-candle average)")
+
+    lean = full_reversal_lean(closed)
+    if lean is None:
+        lines.append("No standard reversal pattern on this candle.")
+        return "\n".join(lines)
+
+    shape, direction = lean["shape"], lean["direction"]
+    if direction is None:
+        lines.append(f"Shape: <b>{shape}</b> -- neutral/indecision, no directional lean")
+        return "\n".join(lines)
+
+    emoji = "\U0001f7e2" if direction == "bullish" else "\U0001f534"
+    status = "confirmed" if lean["confirmed"] else "shape only, not confirmed"
+    lines.append(f"Shape: <b>{shape}</b> ({direction}) {emoji} -- {status}")
+    trend_label = "prior decline" if direction == "bullish" else "prior rally"
+    lines.append(
+        f"  volume confirms: {'✅' if lean['volume_confirms'] else '❌'}   "
+        f"{trend_label} confirms: {'✅' if lean['trend_confirms'] else '❌'}"
+    )
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":

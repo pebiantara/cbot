@@ -1,19 +1,25 @@
 ---
 # System 1 (freqtrade trading bot + its pipeline/binance-whale-listener/
-# dashboard/cloudflared-dashboard support infra), the breakout/reversal
+# dashboard/cloudflared-dashboard support infra) and the breakout/reversal
 # engine (scalp_pattern_signal.py / scalp-pattern-alert / `/fut_`, what the
-# project's own memory calls "System 3" by build order), and
-# futures-liquidation-listener (only consumer was that engine + System 2)
-# are all removed as of 2026-11-11, at the user's request -- trading is
-# now ONLY off the fade engine (quick_scalp_signal.py / quick-scalp-alert /
-# `/scalp_`), which the user calls "System 3" in their own usage. NOTE THE
-# TERMINOLOGY MISMATCH: don't assume "System 3" means scalp_pattern_signal.py
-# just because older memory/code comments say so -- confirm with the user
-# if ambiguous. Code files for everything removed are untouched (user_data/,
-# pipeline/, coin_finder/scalp_pattern_signal.py, coin_finder/dashboard.py,
-# etc.) in case any of this ever needs to come back -- just re-add the
-# service block (no git in this project -- keep a copy of this comment's
-# removed content elsewhere if a restore is ever needed).
+# project's own memory calls "System 3" by build order) are removed as of
+# 2026-11-11, at the user's request -- trading is now ONLY off the fade
+# engine (quick_scalp_signal.py / quick-scalp-alert / `/scalp_`), which the
+# user calls "System 3" in their own usage. NOTE THE TERMINOLOGY MISMATCH:
+# don't assume "System 3" means scalp_pattern_signal.py just because older
+# memory/code comments say so -- confirm with the user if ambiguous. Code
+# files for everything removed are untouched (user_data/, pipeline/,
+# coin_finder/scalp_pattern_signal.py, coin_finder/dashboard.py, etc.) in
+# case any of this ever needs to come back -- just re-add the service block
+# (no git in this project -- keep a copy of this comment's removed content
+# elsewhere if a restore is ever needed).
+#
+# futures-liquidation-listener was ALSO removed 2026-11-11 in that same
+# trim, but revived 2026-11-16 at the user's request -- shadow-logging
+# only (no consumer reads this DB right now), to accumulate real data for
+# testing a specific hypothesis later ("is Binance/the market structurally
+# hunting small traders' stop-losses"). Pure data collection; nothing in
+# the live trading engine uses futures_liquidations.db yet.
 services:
   quick-scalp-alert:
     build: .
@@ -26,6 +32,41 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
     command: python quick_scalp_alert.py
+
+  futures-liquidation-listener:
+    build: .
+    container_name: cbot-futures-liquidation-listener
+    restart: unless-stopped
+    working_dir: /app/coin_finder
+    volumes:
+      - "./coin_finder:/app/coin_finder"
+    environment:
+      - PYTHONUNBUFFERED=1
+    command: python futures_liquidation_listener.py
+
+  btc-crash-alert:
+    build: .
+    container_name: cbot-btc-crash-alert
+    restart: unless-stopped
+    working_dir: /app/coin_finder
+    volumes:
+      - "./coin_finder:/app/coin_finder"
+      - "./.env:/app/.env:ro"
+    environment:
+      - PYTHONUNBUFFERED=1
+    command: python btc_crash_alert.py
+
+  news-alert:
+    build: .
+    container_name: cbot-news-alert
+    restart: unless-stopped
+    working_dir: /app/coin_finder
+    volumes:
+      - "./coin_finder:/app/coin_finder"
+      - "./.env:/app/.env:ro"
+    environment:
+      - PYTHONUNBUFFERED=1
+    command: python news_alert.py
 
   # scalp-early-warning removed 2026-11-06 at the user's request -- alerts
   # should come from the fade engine's confirmed/ready-to-trade signal only.

@@ -41,21 +41,43 @@ import threading
 import time
 
 from orderbook_snapshot import log_snapshot as log_orderbook_snapshot
+from quick_scalp_chase_outcomes import record_signal as record_signal_chase, resolve_matured as resolve_matured_chase
 from quick_scalp_outcomes import record_signal, resolve_matured
 from quick_scalp_pro_outcomes import record_signal as record_signal_pro, resolve_matured as resolve_matured_pro
 from quick_scalp_signal import (
+    QUICK_SCALP_EXCLUDED_SYMBOLS,
+    QUICK_SCALP_TOP_N,
+    _build_delta_map,
+    _resolve_symbols,
     build_quick_scalp_alert_message,
+    build_quick_scalp_chase_alert_message,
     quick_scalp_entry_for_symbol,
+    scan_quick_scalp_chase_signals,
     scan_quick_scalp_signals,
     scan_quick_scalp_signals_pro,
 )
+from market_regime_alert import check_market_regime
+from pattern_watch import check_pattern_watches
 from quick_scalp_watch import check_watches
 from telegram_alert import load_env, send_telegram_message
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATE_JSON = os.path.join(HERE, "quick_scalp_alert_state.json")
+CHASE_STATE_JSON = os.path.join(HERE, "quick_scalp_chase_alert_state.json")
 PRO_STATE_JSON = os.path.join(HERE, "quick_scalp_pro_shadow_state.json")
 POLL_INTERVAL_SECONDS = int(os.environ.get("QUICK_SCALP_POLL_SECONDS", 60))
+
+
+def _current_universe_delta_map():
+    """One delta_map per poll, shared by the fade scan, chase scan, and
+    market-regime check -- added 2026-11-15 alongside CHASE mode so
+    adding a second signal path didn't also add a second (or third)
+    full-universe delta pass per poll. Real cost on a day with network
+    degradation (see cbot_technical_gotchas.md): tripling this work would
+    have made that problem meaningfully worse, not just slower in
+    theory."""
+    symbols = [s for s in _resolve_symbols(QUICK_SCALP_TOP_N) if s not in QUICK_SCALP_EXCLUDED_SYMBOLS]
+    return _build_delta_map(symbols)
 
 
 def load_state(path=STATE_JSON):
@@ -100,7 +122,7 @@ def poll_once_pro_shadow():
         print(f"[PRO shadow] resolve_matured failed: {e} -- continuing")
 
 
-def poll_once():
+def poll_once(delta_map=None):
     env = load_env()
     token, chat_id = env.get("TELEGRAM_BOT_TOKEN"), env.get("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
@@ -110,7 +132,7 @@ def poll_once():
     risk_pct = float(env.get("LEVERAGE_RISK_PCT", "1")) / 100
 
     previous = load_state()
-    signals = scan_quick_scalp_signals()
+    signals = scan_quick_scalp_signals(delta_map=delta_map)
 
     new_state = {}
     for symbol, signal in signals.items():
@@ -144,6 +166,51 @@ def poll_once():
         print(f"resolve_matured failed: {e} -- continuing")
 
 
+def poll_once_chase(delta_map=None):
+    """CHASE-mode poll -- rides a crowded market push instead of fading
+    it, see quick_scalp_signal.py's CHASE_BREADTH_FLOOR comment for the
+    backtest behind this. Same "ready to trade" gating and dedup-on-
+    transition pattern as poll_once() above, own state file and own DB
+    (quick_scalp_chase_outcomes.py) so it can't collide with the fade
+    engine's tracking."""
+    env = load_env()
+    token, chat_id = env.get("TELEGRAM_BOT_TOKEN"), env.get("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        return
+    account_equity = float(env["LEVERAGE_ACCOUNT_EQUITY_USDT"]) if env.get("LEVERAGE_ACCOUNT_EQUITY_USDT") else None
+    risk_pct = float(env.get("LEVERAGE_RISK_PCT", "1")) / 100
+
+    previous = load_state(CHASE_STATE_JSON)
+    signals = scan_quick_scalp_chase_signals(delta_map=delta_map)
+
+    new_state = {}
+    for symbol, signal in signals.items():
+        is_long = signal["is_long"]
+        direction = "LONG" if is_long else "SHORT"
+        entry = quick_scalp_entry_for_symbol(symbol, is_long)
+        ready = entry is not None and entry["at_entry_now"]
+        new_state[symbol] = {"direction": direction, "ready": ready}
+
+        prev = previous.get(symbol)
+        prev = prev if isinstance(prev, dict) else {}
+        if ready and (prev.get("direction") != direction or not prev.get("ready")):
+            message = build_quick_scalp_chase_alert_message(
+                symbol, signal, account_equity=account_equity, risk_pct=risk_pct,
+            )
+            send_telegram_message(message, token, chat_id, parse_mode="HTML")
+            record_signal_chase(symbol, direction, signal["close_price"])
+            print(f"[chase] Alerted (ready to trade): {direction} {symbol}")
+
+    save_state(new_state, CHASE_STATE_JSON)
+
+    try:
+        resolved = resolve_matured_chase()
+        if resolved:
+            print(f"[chase] Resolved {resolved} matured signal/horizon pair(s)")
+    except Exception as e:
+        print(f"[chase] resolve_matured failed: {e} -- continuing")
+
+
 def poll_once_watch():
     """/watch_<symbol>'s poll -- checks every active pre-entry watch
     (see quick_scalp_watch.py) and sends a Telegram message only for a
@@ -155,6 +222,31 @@ def poll_once_watch():
     for symbol, message in check_watches():
         send_telegram_message(message, token, chat_id)
         print(f"[watch] {symbol}: {message}")
+
+
+def poll_once_pattern_watch():
+    """/watch_pattern_<symbol>'s poll -- checks every active pattern watch
+    (see pattern_watch.py) and sends a Telegram message only when a pattern
+    is found or the watch expires."""
+    env = load_env()
+    token, chat_id = env.get("TELEGRAM_BOT_TOKEN"), env.get("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        return
+    for symbol, message in check_pattern_watches():
+        send_telegram_message(message, token, chat_id, parse_mode="HTML")
+        print(f"[pattern watch] {symbol}: {message}")
+
+
+def poll_once_market_regime(delta_map=None):
+    """Market-wide pump/dump watchlist poll -- see market_regime_alert.py."""
+    env = load_env()
+    token, chat_id = env.get("TELEGRAM_BOT_TOKEN"), env.get("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        return
+    message = check_market_regime(delta_map=delta_map)
+    if message:
+        send_telegram_message(message, token, chat_id, parse_mode="HTML")
+        print(f"[market regime] {message}")
 
 
 def poll_once_all():
@@ -172,15 +264,39 @@ def poll_once_all():
     engine (frequency + small edge) rather than keep iterating PRO MODE
     blind. All PRO MODE code/data is left in place for a later revisit,
     not deleted -- see cbot_quick_scalp_signal.md memory and
-    /Users/pebiantara/.claude/plans/cozy-waddling-peacock.md."""
+    /Users/pebiantara/.claude/plans/cozy-waddling-peacock.md.
+
+    CHASE mode (added 2026-11-15, see quick_scalp_signal.py's
+    CHASE_BREADTH_FLOOR) shares the SAME delta_map built once here with
+    the fade poll and the market-regime check -- see
+    _current_universe_delta_map()'s docstring for why that matters on a
+    day with real network degradation."""
+    delta_map = None
     try:
-        poll_once()
+        delta_map = _current_universe_delta_map()
+    except Exception as e:
+        print(f"[scan] shared delta-map build failed: {e} -- fade/chase/regime polls will each build their own", flush=True)
+
+    try:
+        poll_once(delta_map=delta_map)
     except Exception as e:
         print(f"Poll failed: {e} -- continuing")
+    try:
+        poll_once_chase(delta_map=delta_map)
+    except Exception as e:
+        print(f"[chase] poll failed: {e} -- continuing")
     try:
         poll_once_watch()
     except Exception as e:
         print(f"[watch] poll failed: {e} -- continuing")
+    try:
+        poll_once_pattern_watch()
+    except Exception as e:
+        print(f"[pattern watch] poll failed: {e} -- continuing")
+    try:
+        poll_once_market_regime(delta_map=delta_map)
+    except Exception as e:
+        print(f"[market regime] poll failed: {e} -- continuing")
     if os.environ.get("QUICK_SCALP_PRO_SHADOW_ENABLED") == "1":
         try:
             poll_once_pro_shadow()

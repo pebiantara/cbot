@@ -158,7 +158,15 @@ QUICK_SCALP_TOP_N = 50
 # shared PRIORITY_SYMBOLS (used by System 3 too), so it's always in this
 # module's universe unless filtered out here -- scoped to quick-scalp
 # only, System 3's own use of BTC is untouched/unvalidated either way.
-QUICK_SCALP_EXCLUDED_SYMBOLS = {"BTCUSDT"}
+QUICK_SCALP_EXCLUDED_SYMBOLS = {
+    "BTCUSDT",
+    # RWUSDUSDT -- added 2026-11-15, a repeat offender: timed out
+    # ("no response") 5 separate times across 2026-11-14/15 alone, more
+    # than any other symbol by far. RWUSD is a stablecoin, so this pair
+    # has near-zero real volatility anyway -- excluding it costs nothing
+    # strategy-wise and removes a recurring source of scan slowness.
+    "RWUSDUSDT",
+}
 
 QUICK_SCALP_INTERVAL = "15m"  # still used for the entry zone (EMA20/50/200) -- doesn't need to be as fast as the trigger
 
@@ -177,6 +185,74 @@ QUICK_DELTA_CONFIRM_PCT = 0.20  # reverted to 0.20 2026-11-11 (same day as the 0
 # 20.6% fade-hit). Trade-count was tested too and found to go the WRONG way
 # (more trades = worse, likely just major-coin noise) -- NOT used as a filter.
 QUICK_DELTA_MIN_TRADE_COUNT = 1000
+
+# Market-breadth veto -- added 2026-11-15 after a real live incident: a
+# BTC-led broad rally made DOGE/SOL/ENA/TRUMP/FIL/ICP all show a strong
+# buy-dominant push within the same ~35min window, firing 6 independent
+# SHORT fades that ALL lost (price kept rising -1.1% to -2.4% against
+# every one of them). Backtested the exact mechanism on 5 days x 8
+# symbols' real 1m data (fee-aware TP/SL-hit-first simulator, raw
+# delta-only gate, no other filters stacked): bucketing candidates by
+# what fraction of OTHER tracked symbols were ALSO leaning the same
+# direction at that same moment --
+#   breadth 0.0-0.2 (isolated, coin-specific): +0.50%/trade (n=502) --
+#     the ONLY bucket that was net positive on its own
+#   breadth 0.2-0.4: -2.73%/trade (n=446)
+#   breadth 0.4-0.6: -4.74%/trade (n=1213)
+#   breadth 0.6-1.0 (crowded/market-wide, e.g. the incident above): -7.98%/trade (n=1187)
+# Monotonic and large -- fading an isolated push works, fading into a
+# market-wide move doesn't, because it's not symbol-specific exhaustion
+# at all, it's the whole market still trending. BREADTH_VETO_THRESHOLD
+# set at the one bucket boundary that was actually profitable; see
+# _market_breadth()/_build_delta_map() for how this is computed live.
+BREADTH_LEAN_DELTA = 0.10          # another symbol counts as "leaning the same way" above this (lower bar than the 0.20 trigger itself)
+BREADTH_VETO_THRESHOLD = 0.2
+
+# CHASE mode -- added 2026-11-15, same day, at the user's request to make
+# the engine do SOMETHING useful during exactly the high-breadth windows
+# the veto above sits out, instead of just going quiet. Re-ran the SAME
+# backtest bucketing but compared FADE vs CHASE (same direction as the
+# push, not opposite) per bucket:
+#   breadth 0.0-0.2: FADE +1.79%/trade  vs CHASE -2.32%/trade  (n=540)
+#   breadth 0.2-0.4: FADE -1.19%/trade  vs CHASE +0.00%/trade  (n=456)
+#   breadth 0.4-0.6: FADE -3.87%/trade  vs CHASE +0.24%/trade  (n=1159)
+#   breadth 0.6-1.0: FADE -9.71%/trade  vs CHASE +4.78%/trade  (n=1253)
+# A genuine crossover, not just "fade stops working" -- below 0.2,
+# fading an isolated push wins; above ~0.4, riding a crowded push wins
+# instead. CHASE_BREADTH_FLOOR set at that crossover point. Layering the
+# SAME momentum/volume/candle confirmation the fade engine already uses
+# (checked against the PUSH direction here, not the fade direction) on
+# top of the raw breadth>=0.4 trigger took naive chase (+3.74%/trade,
+# n=2273) to confirmed chase (+16.53%/trade, n=202) -- same quality lift
+# pattern as every other confirmation layer in this file, re-validated
+# independently for chase rather than assumed to transfer from fade.
+# funding/mid_trend_1h_4h/ribbon_or_vwap_favorable/candle-veto are
+# DELIBERATELY NOT reused in detect_quick_signal_chase -- those were
+# tuned for a mean-reversion thesis, not re-validated for continuation,
+# don't assume they transfer without testing first.
+CHASE_BREADTH_FLOOR = 0.4
+
+# Extension cap -- added 2026-11-16 after the user flagged chase entries
+# as "too noisy and late, in the middle of the move, not the start."
+# First tested TIME since the push's delta crossing (require <=3min
+# old) -- backtested WORSE, not better (stale pushes >3min old: +20.28%
+# /trade, n=1839; fresh <=3min: +7.80%/trade, n=1074 -- a sustained push
+# is more trustworthy than a brand-new one, confirmed at both 5min and
+# 1min step granularity). So instead tested PRICE EXTENSION (how far
+# price already moved in the push's own direction over the same 10min
+# window) as a separate variable from time -- NOT monotonic, but a real
+# dead zone: extension 0-1% covered 86% of all candidates and was
+# consistently good (+15.96%/trade at 0-0.5%, +17.77%/trade at 0.5-1%),
+# while 1-2% extension was actively bad (-2.32%/trade, n=253). The
+# 2%+ bucket looked great (+58.52%) but n=32 is too thin to trust.
+# CHASE_EXTENSION_MAX_PCT set at that 1% boundary -- cuts the one
+# confirmed-bad pocket, keeps the two confirmed-good ones, doesn't rely
+# on the untrustworthy tail. (Separately tested picking only the
+# single highest breadth*|delta| "strength" candidate per cycle instead
+# of alerting every qualifying one -- made results WORSE, not better,
+# +12.70%/trade vs +15.99% taking every signal -- NOT used.)
+CHASE_EXTENSION_LOOKBACK_MINUTES = 10  # matches the delta window itself
+CHASE_EXTENSION_MAX_PCT = 1.0
 
 # Added back 2026-11-10 (see module docstring UPDATE) -- delta-only was
 # too noisy/unvalidated. All first-guess, unvalidated numbers.
@@ -213,7 +289,7 @@ QUICK_CANDLE_FETCH_LIMIT = max(QUICK_VOLUME_LOOKBACK + 1, QUICK_MOMENTUM_LOOKBAC
 # (see cbot_quick_scalp_signal.md memory for the rollback list) -- lets
 # the user name a version in conversation ("go back to v_fade-only")
 # without needing git (this project has no git repo).
-QUICK_SCALP_VERSION = "v_fade+trend-filter+delta02+wide-sl04+no-btc+candle-veto+ribbon-vwap_2026-11-13"
+QUICK_SCALP_VERSION = "v_fade+trend-filter+delta02+wide-sl04+no-btc+candle-veto+ribbon-vwap+breadth-veto_2026-11-15"
 
 # Binance futures round-trip taker fee, ~0.10% of notional -- used only to
 # size SL/TP meaningfully above cost in the docstring/output math below,
@@ -636,7 +712,7 @@ def quick_scalp_entry_for_symbol(symbol, is_long):
     return entry
 
 
-def detect_quick_signal(symbol, mid_trend):
+def detect_quick_signal(symbol, mid_trend, delta_map=None):
     """Returns {"is_long", "checks", "delta_pct", "trade_count"} if the
     rolling-delta gate + momentum/volume/candle confirmation + light
     sanity checks all confirm and an entry zone exists, else None.
@@ -662,8 +738,21 @@ def detect_quick_signal(symbol, mid_trend):
     leverage_risk.py for the other systems.
     (_quick_already_running) -- rollback: restore
     coin_finder/quick_scalp_signal.py.v_fade-only_2026-11-11 if this
-    makes things worse."""
-    delta_pct, trade_count = _rolling_delta(symbol)
+    makes things worse.
+
+    `delta_map`, if given (see _build_delta_map()), is a {symbol:
+    (delta_pct, trade_count)} snapshot of EVERY scanned symbol taken at
+    the same moment -- used both as this symbol's own delta reading
+    (skips a redundant _rolling_delta call) and to check market breadth
+    (BREADTH_VETO_THRESHOLD) against every OTHER symbol in the same
+    snapshot. Falls back to a fresh standalone _rolling_delta call (and
+    skips the breadth check entirely -- no opinion, same convention as
+    funding_confirms_bullish/bearish) when called without one, e.g. a
+    manual /scalp_ check outside the full scan."""
+    if delta_map is not None:
+        delta_pct, trade_count = delta_map.get(symbol, (None, 0))
+    else:
+        delta_pct, trade_count = _rolling_delta(symbol)
     if delta_pct is None or trade_count < QUICK_DELTA_MIN_TRADE_COUNT or abs(delta_pct) < QUICK_DELTA_CONFIRM_PCT:
         return None
     push_is_long = delta_pct > 0
@@ -695,6 +784,9 @@ def detect_quick_signal(symbol, mid_trend):
     vwap_favors = vwap_favors_fade(vwap_dist_pct, is_long)
     ribbon_or_vwap_favorable = ribbon_favors or vwap_favors
 
+    breadth = _market_breadth(symbol, push_is_long, delta_map) if delta_map else None
+    breadth_not_crowded = breadth is None or breadth < BREADTH_VETO_THRESHOLD
+
     checks = {
         "delta": True,
         "momentum": _quick_momentum_confirms(push_is_long, candles),
@@ -705,9 +797,109 @@ def detect_quick_signal(symbol, mid_trend):
         "mid_trend_1h_4h": mid_ok,
         "no_contradicting_candle": no_contradicting_candle,
         "ribbon_or_vwap_favorable": ribbon_or_vwap_favorable,
+        "breadth_not_crowded": breadth_not_crowded,
     }
     if all(checks.values()) and quick_scalp_entry_for_symbol(symbol, is_long) is not None:
         return {"is_long": is_long, "checks": checks, "delta_pct": delta_pct, "trade_count": trade_count}
+    return None
+
+
+def _quick_chase_extension_ok(symbol, is_long, lookback_minutes=CHASE_EXTENSION_LOOKBACK_MINUTES,
+                               max_pct=CHASE_EXTENSION_MAX_PCT):
+    """True if price hasn't already moved too far in the push's own
+    direction over the last `lookback_minutes` -- see
+    CHASE_EXTENSION_MAX_PCT's comment for the backtest behind this.
+    None-safe: if candles can't be fetched, don't block (no opinion),
+    same convention as everywhere else in this file."""
+    try:
+        candles = get_futures_klines(symbol, "1m", limit=lookback_minutes + 1)
+    except Exception:
+        return True
+    if len(candles) < lookback_minutes + 1:
+        return True
+    start_close, end_close = candles[0]["close"], candles[-1]["close"]
+    if start_close <= 0:
+        return True
+    move_pct = (end_close - start_close) / start_close * 100
+    extension = move_pct if is_long else -move_pct
+    return extension < max_pct
+
+
+def detect_quick_signal_chase(symbol, delta_map):
+    """Rides the push instead of fading it -- see CHASE_BREADTH_FLOOR's
+    comment above for the backtest behind this. Only fires when breadth
+    is high enough that chasing backtested better than fading
+    (CHASE_BREADTH_FLOOR); requires a REAL delta_map snapshot (unlike
+    detect_quick_signal, no standalone-call fallback) since breadth is
+    this function's core gate, not an optional extra check.
+
+    Deliberately does NOT reuse detect_quick_signal's funding/mid-trend/
+    ribbon-vwap/candle-veto checks -- those were tuned for fading, not
+    re-validated for chasing, see CHASE_BREADTH_FLOOR's comment.
+
+    VOLUME-ONLY confirmation (no momentum, no candle) -- changed
+    2026-11-15/16 after the user flagged that chase alerts fired too
+    late ("market started already"). _quick_momentum_confirms requires
+    a 45-MINUTE price move to already be underway before it passes --
+    that's the actual source of the lag, not an unavoidable cost of
+    confirmation in general. Re-tested every subset of
+    momentum/volume/candle on the same 5-day/8-symbol data:
+    momentum-only was the WEAKEST of the three alone (+6.99%/trade,
+    n=941) despite being the laggiest; volume-only alone nearly matched
+    the full 3-check combo's quality (+14.55%/trade, n=578, vs
+    +16.97%/trade, n=170 for all three) with no 45min wait and 3.4x the
+    frequency (and a much higher cum_roi over the test window,
+    +8408% vs +2885%, from that frequency). Adding candle on top of
+    volume made it slightly WORSE, not better (+14.24%, n=264) -- not
+    kept. Rollback: restore momentum+candle checks below if volume-only
+    underperforms on real live data."""
+    if delta_map is None:
+        return None
+    delta_pct, trade_count = delta_map.get(symbol, (None, 0))
+    if delta_pct is None or trade_count < QUICK_DELTA_MIN_TRADE_COUNT or abs(delta_pct) < QUICK_DELTA_CONFIRM_PCT:
+        return None
+    push_is_long = delta_pct > 0
+    is_long = push_is_long  # CHASE -- same direction as the push, not the fade
+
+    breadth = _market_breadth(symbol, push_is_long, delta_map)
+    if breadth is None or breadth < CHASE_BREADTH_FLOOR:
+        return None
+
+    try:
+        candles = get_futures_klines(symbol, QUICK_SCALP_INTERVAL, limit=QUICK_CANDLE_FETCH_LIMIT)
+    except Exception:
+        return None
+
+    checks = {
+        "delta": True,
+        "breadth_crowded_enough": True,  # already gated above; kept in the dict for visibility/symmetry
+        "volume": _quick_volume_confirms(candles),
+        "extension_not_overdone": _quick_chase_extension_ok(symbol, is_long),
+    }
+    if all(checks.values()) and quick_scalp_entry_for_symbol(symbol, is_long) is not None:
+        # Final freshness re-check -- added 2026-11-16 after a real
+        # incident: SUIUSDT's chase LONG was decided using delta_map's
+        # reading of the push (built once at the start of the poll
+        # cycle), but by the time this symbol's OWN per-symbol work
+        # (candle fetch for volume/extension, entry-zone check) finished
+        # a few minutes later, the push had already fully died (delta
+        # collapsed from +0.51 to +0.03) -- the ENTRY PRICE was captured
+        # fresh/live right after this, but the SIGNAL it was based on
+        # was several minutes stale by then. Re-checking delta live,
+        # right before committing, catches exactly this: a push that
+        # looked great when delta_map was built but isn't live anymore
+        # doesn't get to fire just because it once qualified.
+        fresh_delta, fresh_trade_count = _rolling_delta(symbol)
+        still_pushing = (
+            fresh_delta is not None and fresh_trade_count >= QUICK_DELTA_MIN_TRADE_COUNT
+            and (fresh_delta > 0) == push_is_long and abs(fresh_delta) >= QUICK_DELTA_CONFIRM_PCT
+        )
+        if not still_pushing:
+            return None
+        return {
+            "is_long": is_long, "checks": checks, "delta_pct": delta_pct,
+            "trade_count": trade_count, "breadth": breadth,
+        }
     return None
 
 
@@ -782,10 +974,190 @@ def quick_scalp_levels(anchor_price, is_long, leverage, symbol=None):
     return levels
 
 
+def _market_breadth(symbol, push_is_long, delta_map):
+    """Fraction of OTHER symbols in delta_map currently leaning the SAME
+    direction as this symbol's push (matching sign, |delta|>=
+    BREADTH_LEAN_DELTA), out of all OTHER symbols with a valid delta
+    reading in the snapshot. None if no other symbol has valid data --
+    treated as "no opinion, don't block", same convention as
+    funding_confirms_bullish/bearish. See BREADTH_VETO_THRESHOLD above
+    for the backtest behind this."""
+    agree = total = 0
+    for other_symbol, entry in delta_map.items():
+        if other_symbol == symbol or entry is None:
+            continue
+        d, tc = entry
+        if d is None or tc < QUICK_DELTA_MIN_TRADE_COUNT:
+            continue
+        total += 1
+        if (d > 0) == push_is_long and abs(d) >= BREADTH_LEAN_DELTA:
+            agree += 1
+    return agree / total if total else None
+
+
 SCAN_WORKER_COUNT = 8  # see scan_quick_scalp_signals' docstring
 
 
-def scan_quick_scalp_signals(symbols=None, top_n=QUICK_SCALP_TOP_N):
+DELTA_MAP_PER_SYMBOL_TIMEOUT_SECONDS = 20  # _rolling_delta is only 10x 1m candles -- normally fast,
+                                             # this just bounds a real network hang (see below)
+
+
+def _rolling_delta_with_timeout(symbol, timeout=DELTA_MAP_PER_SYMBOL_TIMEOUT_SECONDS):
+    """Same thread+timeout wrapper as _scan_one_symbol_with_timeout, for
+    the exact same reason -- added 2026-11-15 after a real incident: this
+    function originally called _rolling_delta directly inside the pool
+    with no per-symbol bound, so one hung network call stalled this
+    ENTIRE first pass (as_completed() with no timeout blocks until every
+    future finishes, and exiting the pool's `with` block blocks on that
+    same stuck worker) -- which in turn delayed the whole scan behind it,
+    repeatedly tripping the 600s process watchdog with many symbols
+    piling up as simultaneous timeouts. Exact same bug class the project
+    already fixed once for the main per-symbol scan; this closes the gap
+    in the newer delta-map pass instead of re-deriving a different fix."""
+    result_box = queue.Queue(maxsize=1)
+
+    def _worker():
+        try:
+            result_box.put(_rolling_delta(symbol))
+        except Exception:
+            result_box.put((None, 0))
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    t.join(timeout=timeout)
+    if t.is_alive():
+        print(f"[scan] delta-map {symbol}: no response after {timeout}s -- excluded from breadth calc", flush=True)
+        return (None, 0)
+    try:
+        return result_box.get_nowait()
+    except queue.Empty:
+        return (None, 0)
+
+
+def _build_delta_map(symbols):
+    """First pass over the whole scan universe: computes _rolling_delta
+    for every symbol UP FRONT, in parallel, before any of the heavier
+    per-symbol work (candle fetches, mid-trend, etc.) runs. Gives
+    detect_quick_signal() one consistent snapshot to check market
+    breadth against (BREADTH_VETO_THRESHOLD) instead of each symbol's
+    own delta drifting out of sync with the others while slower
+    per-symbol work runs (a symbol can take up to
+    PER_SYMBOL_SCAN_TIMEOUT_SECONDS). Cheap call (10x 1m candles each),
+    so this finishes fast even across the full universe -- bounded per
+    symbol via _rolling_delta_with_timeout (see its docstring)."""
+    delta_map = {}
+    with ThreadPoolExecutor(max_workers=SCAN_WORKER_COUNT) as pool:
+        futures = {pool.submit(_rolling_delta_with_timeout, symbol): symbol for symbol in symbols}
+        for future in as_completed(futures):
+            symbol = futures[future]
+            try:
+                delta_map[symbol] = future.result()
+            except Exception as e:
+                print(f"[scan] delta-map {symbol} raised {e} -- excluded from breadth calc", flush=True)
+    return delta_map
+
+
+# Added 2026-11-15, same day as the breadth veto above, at the user's
+# request to flip that finding around: instead of only using high
+# breadth to BLOCK a fade (this module's own job), surface it as its
+# OWN alert -- "the market itself is moving as a block right now, here
+# are the coins leading it" -- since the backtest showed fading INTO a
+# breadth>=0.6 move was the single worst regime (-7.98%/trade), implying
+# the opposite (riding the move, not fighting it) is the more sensible
+# read in that regime. This is informational only -- no SL/TP, no
+# trade direction recommendation beyond "these are the names moving
+# hardest with the crowd right now" -- it's a watchlist ping, not a new
+# trading engine, so it ships without the backtest-before-ship bar the
+# fade engine's own gates go through.
+MARKET_REGIME_BREADTH_THRESHOLD = 0.6  # matches the worst-performing fade bucket's lower edge
+MARKET_REGIME_LEADER_COUNT = 8
+
+
+def market_regime_snapshot(symbols=None, top_n=QUICK_SCALP_TOP_N, delta_map=None):
+    """{"direction": "bullish"/"bearish", "breadth": frac, "leaders":
+    [(symbol, delta_pct, trade_count), ...]} if >=MARKET_REGIME_BREADTH_THRESHOLD
+    of the universe is currently leaning the same direction, else
+    {"direction": None, "breadth": frac} (the stronger of the two
+    sides, for visibility even when below threshold). None only if no
+    symbol had valid data at all. `leaders` is sorted by |delta_pct|
+    descending, capped at MARKET_REGIME_LEADER_COUNT -- the coins
+    pushing hardest WITH the crowd, i.e. the plausible pump/dump
+    candidates if the move keeps running. `trade_count` (added
+    2026-11-16, display-only -- does NOT feed into the breadth/direction
+    logic above, that was tested weighted and backtested WORSE, see
+    cbot_quick_scalp_signal.md) is just the same rolling-window trade
+    count already computed for the delta reading, surfaced for context
+    ("volume/traders" the user asked to see alongside each leader).
+
+    `delta_map`, if given, skips this function's own _build_delta_map()
+    call -- see scan_quick_scalp_signals' docstring for why (one shared
+    snapshot per poll instead of three separate full-universe passes)."""
+    if symbols is None:
+        symbols = [s for s in _resolve_symbols(top_n) if s not in QUICK_SCALP_EXCLUDED_SYMBOLS]
+    if delta_map is None:
+        delta_map = _build_delta_map(symbols)
+    valid = {
+        s: (d, tc) for s, (d, tc) in delta_map.items()
+        if d is not None and tc >= QUICK_DELTA_MIN_TRADE_COUNT and abs(d) >= BREADTH_LEAN_DELTA
+    }
+    if not valid:
+        return None
+
+    bullish = {s: v for s, v in valid.items() if v[0] > 0}
+    bearish = {s: v for s, v in valid.items() if v[0] < 0}
+    total = len(valid)
+    bullish_frac = len(bullish) / total
+    bearish_frac = len(bearish) / total
+
+    if bullish_frac >= bearish_frac:
+        direction_if_regime, breadth, side = "bullish", bullish_frac, bullish
+    else:
+        direction_if_regime, breadth, side = "bearish", bearish_frac, bearish
+
+    if breadth < MARKET_REGIME_BREADTH_THRESHOLD:
+        return {"direction": None, "breadth": breadth}
+
+    ranked = sorted(side.items(), key=lambda kv: abs(kv[1][0]), reverse=True)[:MARKET_REGIME_LEADER_COUNT]
+    leaders = [(s, d, tc) for s, (d, tc) in ranked]
+    return {"direction": direction_if_regime, "breadth": breadth, "leaders": leaders}
+
+
+def build_market_regime_message(snapshot):
+    """Added live price per leader 2026-11-15 at the user's request ("best
+    price to sign market") -- the current tradeable mark price, fetched
+    fresh per symbol (parallelized, same worker count as the main scan),
+    not a backfilled entry/SL/TP recommendation. This alert stays
+    informational by design (see module docstring above) -- a live price
+    just makes "possible pump/dump candidate" something you could
+    actually act on without a second lookup, it doesn't turn this into a
+    trade signal."""
+    direction = snapshot["direction"]
+    emoji = "\U0001f7e2" if direction == "bullish" else "\U0001f534"
+    label = "BULLISH" if direction == "bullish" else "BEARISH"
+    lines = [
+        f"{emoji} <b>Market-wide {label} move detected</b> ({snapshot['breadth']:.0%} of tracked coins pushing {direction})",
+        "Not a trade signal -- these are the coins moving hardest WITH the crowd right now, "
+        "possible pump/dump continuation candidates if the move keeps running "
+        "(price = current live mark price, for reference only):",
+    ]
+    leaders = snapshot["leaders"]
+    prices = {}
+    with ThreadPoolExecutor(max_workers=SCAN_WORKER_COUNT) as pool:
+        futures = {pool.submit(fetch_live_futures_price, symbol): symbol for symbol, _, _ in leaders}
+        for future in as_completed(futures):
+            symbol = futures[future]
+            try:
+                prices[symbol] = future.result()
+            except Exception:
+                prices[symbol] = None
+    for symbol, delta, trade_count in leaders:
+        price = prices.get(symbol)
+        price_str = f"{price:g}" if price is not None else "n/a"
+        lines.append(f"  {symbol:12} delta={delta:+.2f}  trades={trade_count:,}  price={price_str}")
+    return "\n".join(lines)
+
+
+def scan_quick_scalp_signals(symbols=None, top_n=QUICK_SCALP_TOP_N, delta_map=None):
     """{symbol: signal_dict} for every symbol with a confirmed rolling-delta
     trigger right now. Mirrors scalp_pattern_signal.py's
     scan_scalp_signals in shape.
@@ -803,13 +1175,22 @@ def scan_quick_scalp_signals(symbols=None, top_n=QUICK_SCALP_TOP_N):
     between speed and not tripping Binance's rate limits (429s were seen
     earlier this same project at higher concurrency/burst rates) --
     not yet tuned against real measurements, revisit if 429s show up in
-    logs."""
+    logs.
+
+    `delta_map`, if given, skips this function's own _build_delta_map()
+    call and reuses the caller's snapshot instead -- added so
+    quick_scalp_alert.py can build ONE delta_map per poll and share it
+    with scan_quick_scalp_chase_signals() too, instead of paying for two
+    separate full-universe delta passes every single poll."""
     if symbols is None:
         symbols = [s for s in _resolve_symbols(top_n) if s not in QUICK_SCALP_EXCLUDED_SYMBOLS]
 
+    if delta_map is None:
+        delta_map = _build_delta_map(symbols)
+
     signals = {}
     with ThreadPoolExecutor(max_workers=SCAN_WORKER_COUNT) as pool:
-        futures = {pool.submit(_scan_one_symbol_with_timeout, symbol): symbol for symbol in symbols}
+        futures = {pool.submit(_scan_one_symbol_with_timeout, symbol, delta_map): symbol for symbol in symbols}
         for future in as_completed(futures):
             symbol = futures[future]
             try:
@@ -825,11 +1206,11 @@ def scan_quick_scalp_signals(symbols=None, top_n=QUICK_SCALP_TOP_N):
 PER_SYMBOL_SCAN_TIMEOUT_SECONDS = 90  # see _scan_one_symbol_with_timeout
 
 
-def _scan_one_symbol(symbol, result_box):
+def _scan_one_symbol(symbol, result_box, delta_map=None):
     """Runs in a worker thread -- see _scan_one_symbol_with_timeout."""
     try:
         mid_trend = mid_period_trend(symbol)
-        signal = detect_quick_signal(symbol, mid_trend)
+        signal = detect_quick_signal(symbol, mid_trend, delta_map)
         if signal is not None:
             signal["close_price"] = fetch_live_futures_price(symbol)
             signal["mid_trend"] = mid_trend
@@ -839,7 +1220,7 @@ def _scan_one_symbol(symbol, result_box):
         result_box.put(None)
 
 
-def _scan_one_symbol_with_timeout(symbol, timeout=PER_SYMBOL_SCAN_TIMEOUT_SECONDS):
+def _scan_one_symbol_with_timeout(symbol, delta_map=None, timeout=PER_SYMBOL_SCAN_TIMEOUT_SECONDS):
     """Added 2026-11-13 after a real incident: a single symbol's call
     chain (mid_period_trend/detect_quick_signal) hung for 615+ seconds --
     far beyond any bounded retry chain, a genuine stuck call somewhere
@@ -855,7 +1236,7 @@ def _scan_one_symbol_with_timeout(symbol, timeout=PER_SYMBOL_SCAN_TIMEOUT_SECOND
     as a second line of defense in case this mechanism itself ever has a
     gap, not removed -- defense in depth, not a replacement."""
     result_box = queue.Queue(maxsize=1)
-    t = threading.Thread(target=_scan_one_symbol, args=(symbol, result_box), daemon=True)
+    t = threading.Thread(target=_scan_one_symbol, args=(symbol, result_box, delta_map), daemon=True)
     t.start()
     t.join(timeout=timeout)
     if t.is_alive():
@@ -865,6 +1246,62 @@ def _scan_one_symbol_with_timeout(symbol, timeout=PER_SYMBOL_SCAN_TIMEOUT_SECOND
         return result_box.get_nowait()
     except queue.Empty:
         return None
+
+
+def _scan_one_symbol_chase(symbol, result_box, delta_map):
+    """Runs in a worker thread -- see _scan_one_symbol_chase_with_timeout.
+    No mid_trend fetch (detect_quick_signal_chase doesn't use it, unlike
+    the fade path) -- one less network call per symbol."""
+    try:
+        signal = detect_quick_signal_chase(symbol, delta_map)
+        if signal is not None:
+            signal["close_price"] = fetch_live_futures_price(symbol)
+        result_box.put(signal)
+    except Exception as e:
+        print(f"[chase scan] {symbol} raised {e} -- skipping", flush=True)
+        result_box.put(None)
+
+
+def _scan_one_symbol_chase_with_timeout(symbol, delta_map, timeout=PER_SYMBOL_SCAN_TIMEOUT_SECONDS):
+    """Same bounded-timeout pattern as _scan_one_symbol_with_timeout, same
+    reason -- see its docstring."""
+    result_box = queue.Queue(maxsize=1)
+    t = threading.Thread(target=_scan_one_symbol_chase, args=(symbol, result_box, delta_map), daemon=True)
+    t.start()
+    t.join(timeout=timeout)
+    if t.is_alive():
+        print(f"[chase scan] {symbol}: no response after {timeout}s -- skipping, moving to next coin", flush=True)
+        return None
+    try:
+        return result_box.get_nowait()
+    except queue.Empty:
+        return None
+
+
+def scan_quick_scalp_chase_signals(symbols=None, top_n=QUICK_SCALP_TOP_N, delta_map=None):
+    """CHASE-mode equivalent of scan_quick_scalp_signals() -- see
+    CHASE_BREADTH_FLOOR's comment for the backtest behind this. Shares
+    the SAME delta_map as the fade scan when the caller passes one in
+    (see scan_quick_scalp_signals' own docstring) -- only builds its own
+    if called standalone."""
+    if symbols is None:
+        symbols = [s for s in _resolve_symbols(top_n) if s not in QUICK_SCALP_EXCLUDED_SYMBOLS]
+    if delta_map is None:
+        delta_map = _build_delta_map(symbols)
+
+    signals = {}
+    with ThreadPoolExecutor(max_workers=SCAN_WORKER_COUNT) as pool:
+        futures = {pool.submit(_scan_one_symbol_chase_with_timeout, symbol, delta_map): symbol for symbol in symbols}
+        for future in as_completed(futures):
+            symbol = futures[future]
+            try:
+                signal = future.result()
+            except Exception as e:
+                print(f"[chase scan] {symbol} pool task raised {e} -- skipping", flush=True)
+                continue
+            if signal is not None:
+                signals[symbol] = signal
+    return signals
 
 
 def scan_quick_scalp_signals_pro(symbols=None, top_n=QUICK_SCALP_TOP_N):
@@ -969,6 +1406,46 @@ def _quick_signal_header(signal):
             f"{side}-dominant ({trade_count:,} trades) -- <b>fading</b> this push, not chasing it"
         )
     return lines
+
+
+def _quick_chase_signal_header(signal):
+    """CHASE equivalent of _quick_signal_header -- same shape, "chasing"
+    instead of "fading" since the trade direction IS the push direction
+    here, plus the breadth reading that gated this signal in the first
+    place (see CHASE_BREADTH_FLOOR)."""
+    checks_line = "  ".join(f"{name}{'✅' if passed else '❌'}" for name, passed in signal["checks"].items())
+    lines = [f"✅ <b>Momentum confirmed</b>  {checks_line}"]
+    delta_pct = signal.get("delta_pct")
+    if delta_pct is not None:
+        side = "buy" if delta_pct > 0 else "sell"
+        trade_count = signal.get("trade_count", 0)
+        breadth = signal.get("breadth")
+        breadth_str = f", breadth={breadth:.0%}" if breadth is not None else ""
+        lines.append(
+            f"Order flow (rolling {QUICK_DELTA_WINDOW_MINUTES}m): {abs(delta_pct):.0%} "
+            f"{side}-dominant ({trade_count:,} trades{breadth_str}) -- <b>chasing</b> this push, not fading it"
+        )
+    return lines
+
+
+def build_quick_scalp_chase_alert_message(symbol, signal, leverages=(ALERT_LEVERAGE,), account_equity=None, risk_pct=0.01):
+    """CHASE equivalent of build_quick_scalp_alert_message -- see
+    CHASE_BREADTH_FLOOR's comment for the backtest behind this mode.
+    Same SL/TP sizing (_append_quick_trade_block, flat QUICK_SCALP_SL_ROI/
+    TP_ROI) as the fade engine -- that's what the backtest actually used,
+    not a separately-tuned number."""
+    is_long = signal["is_long"]
+    emoji = "\U0001f7e2" if is_long else "\U0001f534"
+    direction = "LONG" if is_long else "SHORT"
+    lines = [f"{emoji} <b>Quick scalp CHASE READY TO TRADE: {direction} {symbol}</b>",
+             "(riding a crowded market move, not a reversal fade -- see /pattern_ or the market-regime "
+             "alert for more context before entering)"]
+    lines += _quick_chase_signal_header(signal)
+
+    for leverage in leverages:
+        lines.append(f"\n<b>── {leverage}x ──</b>")
+        _append_quick_trade_block(lines, symbol, is_long, leverage, account_equity, risk_pct)
+    return "\n".join(lines)
 
 
 def build_quick_scalp_message(symbol, leverage, account_equity=None, risk_pct=0.01):
