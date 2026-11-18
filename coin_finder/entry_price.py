@@ -7,8 +7,7 @@ match MyStrategy.py's existing numbers (stoploss -3%, minimal_roi +4%) so this
 stays consistent with what the bot itself would actually do.
 """
 
-import json
-import urllib.request
+from http_pool import SESSION
 
 STOP_LOSS_PCT = 0.03
 TAKE_PROFIT_PCT = 0.04
@@ -22,8 +21,9 @@ def fetch_live_price(symbol):
     and wouldn't change the EMA-based entry_low/entry_high meaningfully anyway."""
     try:
         url = f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}"
-        with urllib.request.urlopen(url, timeout=5) as resp:
-            return float(json.loads(resp.read())["price"])
+        resp = SESSION.get(url, timeout=5)
+        resp.raise_for_status()
+        return float(resp.json()["price"])
     except Exception:
         return None
 
@@ -36,8 +36,9 @@ def fetch_live_futures_price(symbol):
     this instead of spot. None if the symbol isn't listed on futures."""
     try:
         url = f"https://fapi.binance.com/fapi/v1/ticker/price?symbol={symbol}"
-        with urllib.request.urlopen(url, timeout=5) as resp:
-            return float(json.loads(resp.read())["price"])
+        resp = SESSION.get(url, timeout=5)
+        resp.raise_for_status()
+        return float(resp.json()["price"])
     except Exception:
         return None
 
@@ -49,8 +50,9 @@ def fetch_live_futures_prices():
     one per symbol. Used by scalp_early_warning.py's poll loop."""
     try:
         url = "https://fapi.binance.com/fapi/v1/ticker/price"
-        with urllib.request.urlopen(url, timeout=5) as resp:
-            rows = json.loads(resp.read())
+        resp = SESSION.get(url, timeout=5)
+        resp.raise_for_status()
+        rows = resp.json()
         return {row["symbol"]: float(row["price"]) for row in rows}
     except Exception:
         return {}

@@ -9,11 +9,11 @@ enough real signals accumulate. SHADOW ONLY -- never gates or changes a
 live signal, same convention as the paused PRO MODE's Stage B logging.
 """
 
-import json
 import os
 import sqlite3
 import time
-import urllib.request
+
+from http_pool import SESSION
 
 FUTURES_API = "https://fapi.binance.com"
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -23,8 +23,9 @@ IMBALANCE_PCT_RANGE = 0.5  # +/- 0.5% around mid price, same ballpark as a scalp
 
 def fetch_depth(symbol, limit=100):
     url = f"{FUTURES_API}/fapi/v1/depth?symbol={symbol}&limit={limit}"
-    with urllib.request.urlopen(url, timeout=8) as resp:
-        return json.loads(resp.read())
+    resp = SESSION.get(url, timeout=8)
+    resp.raise_for_status()
+    return resp.json()
 
 
 def orderbook_imbalance(depth, pct_range=IMBALANCE_PCT_RANGE):

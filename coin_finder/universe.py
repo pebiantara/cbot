@@ -1,9 +1,10 @@
 """Binance USDT spot universe: pairs with enough 24h volume to trade without slippage."""
 
-import json
 import time
-import urllib.error
-import urllib.request
+
+import requests
+
+from http_pool import SESSION
 
 BINANCE_API = "https://api.binance.com"
 COINGECKO_API = "https://api.coingecko.com"
@@ -49,9 +50,10 @@ def _get(path, base=BINANCE_API):
     last_error = None
     for attempt in range(_GET_RETRIES):
         try:
-            with urllib.request.urlopen(url, timeout=15) as resp:
-                return json.loads(resp.read())
-        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+            resp = SESSION.get(url, timeout=15)
+            resp.raise_for_status()
+            return resp.json()
+        except (requests.exceptions.RequestException, TimeoutError, ConnectionError) as e:
             last_error = e
             if attempt < _GET_RETRIES - 1:
                 time.sleep(_GET_RETRY_BACKOFF_SECONDS * (attempt + 1))
@@ -81,13 +83,36 @@ def get_non_crypto_symbols():
     return _non_crypto_symbols_cache
 
 
+# exchangeInfo's TRADING/USDT-pair listing changes rarely (new listing/
+# delisting), so a long TTL is safe. ticker/24hr (volume) actually moves,
+# but only needs to be fresh within a poll cycle -- see get_universe()'s
+# TTL below for why both are cached at all.
+_USDT_PAIRS_CACHE = {"pairs": None, "fetched_at": 0.0}
+USDT_PAIRS_TTL_SECONDS = 600
+
+# quick_scalp_signal.py's _resolve_symbols() calls get_universe() up to 4x
+# per single ~60s poll cycle (fade scan, chase scan, PRO shadow scan,
+# market-regime snapshot) -- added 2026-11-17 after finding this was
+# refetching + re-parsing the full exchangeInfo/ticker-24hr payloads 4
+# times every minute with zero caching, a major real CPU/network cost
+# (see http_pool.py's docstring for the related investigation). A TTL
+# just under the usual poll interval means one real fetch per cycle,
+# while still refreshing volume data every cycle rather than going stale.
+_UNIVERSE_CACHE = {}  # min_quote_volume -> {"universe": [...], "fetched_at": ts}
+UNIVERSE_TTL_SECONDS = 45
+
+
 def get_usdt_pairs():
     """All Binance USDT spot pairs that are actively trading, excluding tokenized
     stocks/ETFs (bStocks/xStocks), USD-pegged stablecoins, and commodity-pegged
     tokens -- this project only trades crypto with real price movement."""
+    now = time.time()
+    if _USDT_PAIRS_CACHE["pairs"] is not None and now - _USDT_PAIRS_CACHE["fetched_at"] < USDT_PAIRS_TTL_SECONDS:
+        return _USDT_PAIRS_CACHE["pairs"]
+
     info = _get("/api/v3/exchangeInfo")
     non_crypto = get_non_crypto_symbols()
-    return {
+    pairs = {
         s["symbol"]
         for s in info["symbols"]
         if s["quoteAsset"] == "USDT"
@@ -97,10 +122,18 @@ def get_usdt_pairs():
         and s["baseAsset"].upper() not in STABLECOIN_SYMBOLS
         and s["baseAsset"].upper() not in COMMODITY_PEGGED_SYMBOLS
     }
+    _USDT_PAIRS_CACHE["pairs"] = pairs
+    _USDT_PAIRS_CACHE["fetched_at"] = now
+    return pairs
 
 
 def get_universe(min_quote_volume=MIN_QUOTE_VOLUME_USDT):
     """USDT pairs with 24h quote volume >= min_quote_volume, sorted by volume desc."""
+    now = time.time()
+    cached = _UNIVERSE_CACHE.get(min_quote_volume)
+    if cached is not None and now - cached["fetched_at"] < UNIVERSE_TTL_SECONDS:
+        return cached["universe"]
+
     pairs = get_usdt_pairs()
     tickers = _get("/api/v3/ticker/24hr")
 
@@ -114,6 +147,7 @@ def get_universe(min_quote_volume=MIN_QUOTE_VOLUME_USDT):
             universe.append({"symbol": symbol, "quote_volume_usdt": quote_volume})
 
     universe.sort(key=lambda x: x["quote_volume_usdt"], reverse=True)
+    _UNIVERSE_CACHE[min_quote_volume] = {"universe": universe, "fetched_at": now}
     return universe
 
 

@@ -1,12 +1,12 @@
 """Download Binance candle history (1h/4h/1d) for coins in the universe."""
 
 import csv
-import json
 import os
 import time
-import urllib.error
-import urllib.request
 
+import requests
+
+from http_pool import SESSION
 from universe import get_universe
 
 BINANCE_API = "https://api.binance.com"
@@ -29,13 +29,21 @@ _GET_RETRY_BACKOFF_SECONDS = 0.5
 
 
 def _get(base_url, path):
+    """Uses the shared pooled SESSION (http_pool.py) -- added 2026-11-17,
+    replacing a fresh urllib.request.urlopen() per call (a new TCP+TLS
+    connection every single time) with a reused, keep-alive connection
+    to the same host. Real, measured fix for sustained high CPU usage
+    at this function's call volume (this is the single most-called `_get`
+    in the whole container: delta_map, fade scan, and chase scan all
+    route their candle fetches through get_futures_klines -> here)."""
     url = f"{base_url}{path}"
     last_error = None
     for attempt in range(_GET_RETRIES):
         try:
-            with urllib.request.urlopen(url, timeout=15) as resp:
-                return json.loads(resp.read())
-        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+            resp = SESSION.get(url, timeout=15)
+            resp.raise_for_status()
+            return resp.json()
+        except requests.exceptions.RequestException as e:
             last_error = e
             if attempt < _GET_RETRIES - 1:
                 time.sleep(_GET_RETRY_BACKOFF_SECONDS * (attempt + 1))

@@ -21,10 +21,9 @@ None -> doesn't block). A failed API call shouldn't silently kill a signal
 that's otherwise fully confirmed.
 """
 
-import json
 import time
-import urllib.request
 
+from http_pool import SESSION
 from liquidation_store import net_liquidation_usd
 
 FUTURES_API = "https://fapi.binance.com"
@@ -44,8 +43,9 @@ OI_RISE_BLOCK_PCT = 1.0
 
 def _get(path):
     url = f"{FUTURES_API}{path}"
-    with urllib.request.urlopen(url, timeout=10) as resp:
-        return json.loads(resp.read())
+    resp = SESSION.get(url, timeout=10)
+    resp.raise_for_status()
+    return resp.json()
 
 
 def get_funding_rate(symbol):

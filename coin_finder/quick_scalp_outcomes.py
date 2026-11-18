@@ -16,7 +16,8 @@ import json
 import os
 import sqlite3
 import time
-import urllib.request
+
+from http_pool import SESSION
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "quick_scalp_predictions.db")
 FUTURES_API = "https://fapi.binance.com"
@@ -83,8 +84,9 @@ def _closest_futures_candle(symbol, target_time, tolerance_seconds=CANDLE_TOLERA
     url = (f"{FUTURES_API}/fapi/v1/klines?symbol={symbol}&interval=15m"
            f"&startTime={start_ms}&endTime={end_ms}&limit=10")
     try:
-        with urllib.request.urlopen(url, timeout=10) as resp:
-            raw = json.loads(resp.read())
+        resp = SESSION.get(url, timeout=10)
+        resp.raise_for_status()
+        raw = resp.json()
     except Exception:
         return None
     if not raw:
