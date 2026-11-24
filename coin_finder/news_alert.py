@@ -7,16 +7,29 @@ to now require a paid plan -- RSS straight from the outlets themselves is
 free, unauthenticated, and arguably more "trusted" anyway since there's no
 aggregator/scoring layer in between.
 
-Headline-only, no sentiment scoring -- just "this named coin is in the
-news right now," informational context same as
-market_regime_alert.py/btc_crash_alert.py, not a trade signal.
-
 Matching is name-based (e.g. "Bitcoin", "Solana"), not bare-ticker-based --
 a 2-4 letter symbol like SUI/OP/FET collides too often with ordinary
 English words in free-text headlines to match reliably without a lot of
 false positives. NEWS_NAME_MAP only covers common majors/large-caps; a
 coin not in the map is silently never matched (no alert), rather than risk
 noise from guessing at a name.
+
+Every alert includes a "possible effect" read (added 2026-11-18 at the
+user's request), combining two things for each matched coin:
+  1. Headline tone -- a plain KEYWORD-COUNT heuristic (HEADLINE_BULLISH_WORDS
+     vs HEADLINE_BEARISH_WORDS), explicitly NOT real sentiment analysis/NLP.
+     This is deliberately crude; treat the tone label as a rough cue, not a
+     verified read of what the article actually argues.
+  2. The coin's current technical read -- same technical_score() the Green
+     Coin pipeline uses (EMA/RSI/MACD/ATR), with combine.py's GREEN/RED
+     cutoffs (0.6/0.4) mirrored here for a consistent bullish/neutral/bearish
+     label. Technical-only (no ml_score/whale_score), so this is a narrower
+     signal than combine.py's actual GREEN/YELLOW/RED.
+The two are combined into one line: tone agreeing with the existing trend
+reads as "could extend the move," tone disagreeing reads as "mixed signal,"
+and ATR% is included so a move can be judged against the coin's own normal
+volatility instead of in a vacuum. Still informational only, not a trade
+signal -- same convention as market_regime_alert.py/btc_crash_alert.py.
 
 Dedup: persists seen item guids to NEWS_STATE_JSON so a restart doesn't
 re-alert the whole feed. The first poll after a fresh start seeds "seen"
@@ -33,7 +46,9 @@ import time
 import xml.etree.ElementTree as ET
 
 from entry_price import fetch_live_futures_price
+from history import get_futures_klines
 from http_pool import SESSION
+from technical import technical_score
 from news_outcomes import record_signal as record_news_signal, resolve_matured as resolve_matured_news
 from telegram_alert import load_env, send_telegram_message
 
@@ -116,6 +131,101 @@ _COMPILED = {
     for symbol, keywords in NEWS_NAME_MAP.items()
 }
 
+# Plain keyword-count heuristic for headline tone -- see module docstring's
+# caveat: this is NOT sentiment analysis/NLP, just a rough directional cue.
+HEADLINE_BEARISH_WORDS = [
+    r"\bcrash(?:es|ed|ing)?\b", r"\bslump(?:s|ed|ing)?\b", r"\bdrop(?:s|ped|ping)?\b",
+    r"\bplung(?:e|es|ed|ing)\b", r"\bsinks?\b", r"\bfalls?\b", r"\bfell\b",
+    r"\bsell-?off\b", r"\boutflow(?:s)?\b", r"\bhack(?:s|ed|ing)?\b", r"\bexploit(?:s|ed)?\b",
+    r"\blawsuit(?:s)?\b", r"\bbans?\b", r"\bbanned\b", r"\bfraud\b", r"\bwarns?\b", r"\bwarning\b",
+    r"\bfear\b", r"\brisks?\b", r"\brisky\b", r"\bliquidat(?:ion|ed|es)\b", r"\bdump(?:s|ed|ing)?\b",
+    r"\bbearish\b", r"\bdeclin(?:e|es|ed)\b", r"\bloss(?:es)?\b", r"\blosing\b", r"\bwritedown\b",
+    r"\bprobe(?:s|d)?\b", r"\bseiz(?:e|es|ed|ure)\b", r"\bsuspend(?:s|ed|ing)?\b",
+    r"\bbreach(?:ed|es)?\b", r"\bcollapse(?:s|d)?\b", r"\bslides?\b", r"\bselloff\b",
+]
+HEADLINE_BULLISH_WORDS = [
+    r"\bsurge(?:s|d)?\b", r"\brall(?:y|ies|ied)\b", r"\bgains?\b", r"\bgained\b",
+    r"\bjump(?:s|ed|ing)?\b", r"\bsoar(?:s|ed|ing)?\b", r"\bpartnerships?\b", r"\badoption\b",
+    r"\bapprov(?:al|es|ed)\b", r"\binflow(?:s)?\b", r"\bbullish\b", r"\brecord high\b",
+    r"\bbreakout\b", r"\bupgrad(?:e|es|ed)\b", r"\bbuybacks?\b", r"\boutperform(?:s|ed)?\b",
+    r"\brebound(?:s|ed)?\b", r"\brecover(?:s|y|ed)?\b", r"\blistings?\b", r"\bexpansion\b",
+    r"\bmilestone\b",
+]
+_BEARISH_RE = [re.compile(p, re.IGNORECASE) for p in HEADLINE_BEARISH_WORDS]
+_BULLISH_RE = [re.compile(p, re.IGNORECASE) for p in HEADLINE_BULLISH_WORDS]
+
+# Mirrors combine.py's GREEN_THRESHOLD/RED_THRESHOLD (not imported directly --
+# combine.py pulls in outcomes.py's file I/O, more than this needs) so the
+# bullish/neutral/bearish label here reads consistently with the rest of the
+# project, even though this is technical_score only, not the full final_score.
+TECH_BULLISH_MIN = 0.6
+TECH_BEARISH_MAX = 0.4
+
+
+def headline_tone(title, description):
+    text = f"{title} {description}"
+    bull_hits = sum(1 for p in _BULLISH_RE if p.search(text))
+    bear_hits = sum(1 for p in _BEARISH_RE if p.search(text))
+    if bull_hits > bear_hits:
+        return "bullish"
+    if bear_hits > bull_hits:
+        return "bearish"
+    return "neutral"
+
+
+def technical_snapshot(symbol):
+    """Price + trend label + RSI + ATR% for one coin, or None if there isn't
+    enough candle history yet (e.g. a very new futures listing)."""
+    try:
+        history_by_tf = {
+            "1h": get_futures_klines(symbol, "1h"),
+            "4h": get_futures_klines(symbol, "4h"),
+            "1d": get_futures_klines(symbol, "1d"),
+        }
+        score, indicators = technical_score(history_by_tf)
+    except Exception as e:
+        print(f"technical_snapshot failed for {symbol}: {e} -- continuing")
+        return None
+    if score is None:
+        return None
+    if score >= TECH_BULLISH_MIN:
+        label = "bullish"
+    elif score <= TECH_BEARISH_MAX:
+        label = "bearish"
+    else:
+        label = "neutral"
+    return {
+        "price": indicators["close"],
+        "label": label,
+        "score": score,
+        "rsi": indicators["rsi"],
+        "atr_pct": indicators["atr_pct"],
+    }
+
+
+def possible_effect_line(symbol, tone, snapshot):
+    """One line combining headline tone + the coin's existing technical read
+    into a rough "possible effect" -- agreement reads as a continuation cue,
+    disagreement reads as a mixed signal. ATR% is included so the reader can
+    judge any move against the coin's own normal volatility."""
+    if snapshot is None:
+        return f"\U0001f4ca {symbol}: tone {tone} (no technical snapshot available -- insufficient candle history)"
+
+    price_str = f"${snapshot['price']:,.4f}" if snapshot["price"] < 1 else f"${snapshot['price']:,.2f}"
+    base = (f"\U0001f4ca {symbol}: {price_str} | trend {snapshot['label']} (tech {snapshot['score']:.2f}) "
+            f"| RSI {snapshot['rsi']:.0f} | 1h ATR {snapshot['atr_pct']:.1f}%")
+
+    if tone == "neutral":
+        read = "headline tone neutral -- no strong directional cue from the text itself"
+    elif tone == snapshot["label"]:
+        read = f"headline tone {tone} agrees with the existing {snapshot['label']} trend -- could extend the move"
+    elif snapshot["label"] == "neutral":
+        read = f"headline tone {tone}, but {symbol}'s trend is currently neutral -- no strong confirmation either way"
+    else:
+        read = f"headline tone {tone} conflicts with the existing {snapshot['label']} trend -- mixed signal, watch for confirmation"
+
+    return f"{base}\n\U0001f9ed {read} (heuristic, not verified sentiment)"
+
 
 def load_state():
     if not os.path.exists(STATE_JSON):
@@ -185,17 +295,21 @@ def poll_once(state):
         if not coins:
             continue
 
-        send_telegram_message(
-            f"\U0001f4f0 News ({'/'.join(coins)}): {item['title']}\n{item['link']}",
-            token, chat_id,
-        )
-        print(f"News alert: {coins} -- {item['title']}")
-
+        tone = headline_tone(item["title"], item["description"])
         now = time.time()
+        effect_lines = []
         for symbol in coins:
-            price = fetch_live_futures_price(f"{symbol}USDT")
+            snapshot = technical_snapshot(f"{symbol}USDT")
+            effect_lines.append(possible_effect_line(symbol, tone, snapshot))
+
+            price = snapshot["price"] if snapshot else fetch_live_futures_price(f"{symbol}USDT")
             if price is not None:
                 record_news_signal(f"{symbol}USDT", price, item["title"], snapshot_time=now)
+
+        message = (f"\U0001f4f0 News ({'/'.join(coins)}): {item['title']}\n{item['link']}\n\n"
+                   + "\n\n".join(effect_lines))
+        send_telegram_message(message, token, chat_id)
+        print(f"News alert: {coins} -- {item['title']}")
 
     save_state(state)
 

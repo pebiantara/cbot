@@ -19,6 +19,7 @@ __pycache__/
 # (watchlist.csv, token_map.csv) is intentionally NOT listed here.
 *.db
 *_state.json
+*_price_history.json
 dashboard_url.json
 portfolio_ledger.json
 green_list.json

@@ -68,6 +68,91 @@ services:
       - PYTHONUNBUFFERED=1
     command: python news_alert.py
 
+  support-resistance-alert:
+    build: .
+    container_name: cbot-support-resistance-alert
+    restart: unless-stopped
+    working_dir: /app/coin_finder
+    volumes:
+      - "./coin_finder:/app/coin_finder"
+      - "./.env:/app/.env:ro"
+    environment:
+      - PYTHONUNBUFFERED=1
+    command: python support_resistance_alert.py
+
+  big-mover-alert:
+    build: .
+    container_name: cbot-big-mover-alert
+    restart: unless-stopped
+    working_dir: /app/coin_finder
+    volumes:
+      - "./coin_finder:/app/coin_finder"
+      - "./.env:/app/.env:ro"
+    environment:
+      - PYTHONUNBUFFERED=1
+    command: python big_mover_alert.py
+
+  alpha-mover-alert:
+    build: .
+    container_name: cbot-alpha-mover-alert
+    restart: unless-stopped
+    working_dir: /app/coin_finder
+    volumes:
+      - "./coin_finder:/app/coin_finder"
+      - "./.env:/app/.env:ro"
+    environment:
+      - PYTHONUNBUFFERED=1
+    command: python alpha_mover_alert.py
+
+  unlock-alert:
+    build: .
+    container_name: cbot-unlock-alert
+    restart: unless-stopped
+    working_dir: /app/coin_finder
+    volumes:
+      - "./coin_finder:/app/coin_finder"
+      - "./.env:/app/.env:ro"
+    environment:
+      - PYTHONUNBUFFERED=1
+    command: python unlock_alert.py
+
+  liquidation-cascade-alert:
+    build: .
+    container_name: cbot-liquidation-cascade-alert
+    restart: unless-stopped
+    working_dir: /app/coin_finder
+    volumes:
+      - "./coin_finder:/app/coin_finder"
+      - "./.env:/app/.env:ro"
+    environment:
+      - PYTHONUNBUFFERED=1
+    command: python liquidation_cascade_alert.py
+
+  reversal-watch-alert:
+    build: .
+    container_name: cbot-reversal-watch-alert
+    restart: unless-stopped
+    working_dir: /app/coin_finder
+    volumes:
+      - "./coin_finder:/app/coin_finder"
+      - "./.env:/app/.env:ro"
+    environment:
+      - PYTHONUNBUFFERED=1
+    command: python reversal_watch_alert.py
+
+  binance-trades:
+    build: .
+    container_name: cbot-binance-trades
+    restart: unless-stopped
+    working_dir: /app/whale_scanner
+    volumes:
+      - "./coin_finder:/app/coin_finder"
+      - "./whale_scanner:/app/whale_scanner"
+      - "./.env:/app/.env:ro"
+    environment:
+      - PYTHONUNBUFFERED=1
+    command: python binance_trades.py
+
   # scalp-early-warning removed 2026-11-06 at the user's request -- alerts
   # should come from the fade engine's confirmed/ready-to-trade signal only.
   # scalp_early_warning.py itself is untouched (coin_finder/) in case this

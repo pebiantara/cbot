@@ -81,7 +81,15 @@ def restart_tunnel(client, container_name, label):
 
 
 def main():
-    client = docker.from_env()
+    # Explicit short timeout -- added 2026-11-22 after a real incident: the
+    # default docker-py client timeout left a hung restart() call (seen
+    # twice: "Read timed out (read timeout=70)") blocking this ENTIRE
+    # single-threaded loop for ~70s, during which BOTH tunnels' health
+    # checks are frozen too -- so one stuck restart call silently extended
+    # the outage well past the normal ~30s detection window. A short
+    # timeout makes a stuck call fail fast instead, so the next poll (10s
+    # later) gets a fresh attempt instead of waiting out a long HTTP hang.
+    client = docker.from_env(timeout=15)
     print(f"Watching {WEBHOOK_SERVER_CONTAINER} and {DASHBOARD_CONTAINER} for tunnel URL changes...",
           flush=True)
     last_webhook_url = None

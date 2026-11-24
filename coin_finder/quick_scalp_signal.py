@@ -1089,6 +1089,18 @@ def market_regime_snapshot(symbols=None, top_n=QUICK_SCALP_TOP_N, delta_map=None
     count already computed for the delta reading, surfaced for context
     ("volume/traders" the user asked to see alongside each leader).
 
+    Also includes "resisters" (added 2026-11-22 at the user's request to
+    find coins "small reducing drop or up" during a confirmed market
+    move, after KERNEL/HUMA/SKY kept climbing through a broadly bearish
+    tape) -- the mirror image of `leaders`: ranked by raw delta_pct
+    (not magnitude) over EVERY symbol with valid delta data, most-
+    positive-first in a bearish regime / most-negative-first in a
+    bullish one. Deliberately ranked over ALL valid symbols rather than
+    `valid` below (which already drops near-flat coins via
+    BREADTH_LEAN_DELTA) -- a coin sitting flat while the crowd dumps is
+    exactly the relative-strength signal this is meant to surface, so it
+    must not be filtered out before ranking.
+
     `delta_map`, if given, skips this function's own _build_delta_map()
     call -- see scan_quick_scalp_signals' docstring for why (one shared
     snapshot per poll instead of three separate full-universe passes)."""
@@ -1096,10 +1108,11 @@ def market_regime_snapshot(symbols=None, top_n=QUICK_SCALP_TOP_N, delta_map=None
         symbols = [s for s in _resolve_symbols(top_n) if s not in QUICK_SCALP_EXCLUDED_SYMBOLS]
     if delta_map is None:
         delta_map = _build_delta_map(symbols)
-    valid = {
+    all_valid = {
         s: (d, tc) for s, (d, tc) in delta_map.items()
-        if d is not None and tc >= QUICK_DELTA_MIN_TRADE_COUNT and abs(d) >= BREADTH_LEAN_DELTA
+        if d is not None and tc >= QUICK_DELTA_MIN_TRADE_COUNT
     }
+    valid = {s: v for s, v in all_valid.items() if abs(v[0]) >= BREADTH_LEAN_DELTA}
     if not valid:
         return None
 
@@ -1119,7 +1132,87 @@ def market_regime_snapshot(symbols=None, top_n=QUICK_SCALP_TOP_N, delta_map=None
 
     ranked = sorted(side.items(), key=lambda kv: abs(kv[1][0]), reverse=True)[:MARKET_REGIME_LEADER_COUNT]
     leaders = [(s, d, tc) for s, (d, tc) in ranked]
-    return {"direction": direction_if_regime, "breadth": breadth, "leaders": leaders}
+
+    resister_ranked = sorted(
+        all_valid.items(), key=lambda kv: kv[1][0], reverse=(direction_if_regime == "bearish")
+    )[:MARKET_REGIME_LEADER_COUNT]
+    resisters = [(s, d, tc) for s, (d, tc) in resister_ranked]
+
+    total_buy_usd, total_sell_usd = _market_wide_volume_totals(list(all_valid.keys()))
+
+    return {
+        "direction": direction_if_regime, "breadth": breadth, "leaders": leaders, "resisters": resisters,
+        "total_buy_usd": total_buy_usd, "total_sell_usd": total_sell_usd,
+        "window_minutes": QUICK_DELTA_WINDOW_MINUTES,
+    }
+
+
+def _market_wide_volume_totals(symbols, window_minutes=QUICK_DELTA_WINDOW_MINUTES):
+    """Aggregate buy/sell USD volume across `symbols` over the trailing
+    `window_minutes` of 1m candles -- added 2026-11-22 at the user's
+    request to show total buyer vs. total seller volume on the
+    market-wide regime alert. Same window as _rolling_delta's own
+    per-symbol delta read, but in $ terms -- comparing base-asset buy/
+    sell volume ACROSS different coins is meaningless (1 BTC and 1 PEPE
+    aren't comparable amounts), so this uses quote_volume/
+    taker_buy_quote_volume instead of _rolling_delta's base-asset fields.
+    Kept as its OWN klines fetch, separate from delta_map/_rolling_delta
+    (left untouched) -- that's the live fade engine's core signal, not
+    worth the risk of changing its return shape just for this purely
+    informational market-wide total. Returns (total_buy_usd,
+    total_sell_usd); either side is 0.0 for any symbol that couldn't be
+    fetched in time."""
+    def _one(symbol):
+        try:
+            candles = get_futures_klines(symbol, "1m", limit=window_minutes)
+        except Exception:
+            return 0.0, 0.0
+        if len(candles) < window_minutes:
+            return 0.0, 0.0
+        buy = sum(c["taker_buy_quote_volume"] for c in candles)
+        sell = sum(c["quote_volume"] for c in candles) - buy
+        return buy, sell
+
+    total_buy = total_sell = 0.0
+    with ThreadPoolExecutor(max_workers=SCAN_WORKER_COUNT) as pool:
+        for buy, sell in pool.map(_one, symbols):
+            total_buy += buy
+            total_sell += sell
+    return total_buy, total_sell
+
+
+def _per_symbol_volume_detail(symbols, window_minutes=QUICK_DELTA_WINDOW_MINUTES):
+    """{symbol: {"buy_usd", "sell_usd", "high", "low"}} -- added 2026-11-23
+    at the user's request to break the market-regime alert's PER-COIN
+    leaders/resisters lines down the same way big_mover_alert.py's own
+    alerts already were (see that module's volume_confirmed() for the
+    same buy/sell-in-$ + realized-range idea). Same window as the delta
+    reading that put each coin on the list in the first place, so the
+    aggression shown actually explains the delta, not some other period.
+    Separate fetch from _market_wide_volume_totals (that one SUMS across
+    the whole universe; this one keeps each symbol's own breakdown) and
+    from delta_map/_rolling_delta (left untouched, same reasoning as
+    _market_wide_volume_totals's docstring)."""
+    def _one(symbol):
+        try:
+            candles = get_futures_klines(symbol, "1m", limit=window_minutes)
+        except Exception:
+            return symbol, None
+        if len(candles) < window_minutes:
+            return symbol, None
+        buy = sum(c["taker_buy_quote_volume"] for c in candles)
+        sell = sum(c["quote_volume"] for c in candles) - buy
+        return symbol, {
+            "buy_usd": buy, "sell_usd": sell,
+            "high": max(c["high"] for c in candles), "low": min(c["low"] for c in candles),
+        }
+
+    detail = {}
+    with ThreadPoolExecutor(max_workers=SCAN_WORKER_COUNT) as pool:
+        for symbol, result in pool.map(_one, symbols):
+            if result is not None:
+                detail[symbol] = result
+    return detail
 
 
 def build_market_regime_message(snapshot):
@@ -1136,24 +1229,62 @@ def build_market_regime_message(snapshot):
     label = "BULLISH" if direction == "bullish" else "BEARISH"
     lines = [
         f"{emoji} <b>Market-wide {label} move detected</b> ({snapshot['breadth']:.0%} of tracked coins pushing {direction})",
+    ]
+    total_buy_usd = snapshot.get("total_buy_usd")
+    total_sell_usd = snapshot.get("total_sell_usd")
+    if total_buy_usd is not None and (total_buy_usd + total_sell_usd) > 0:
+        window_minutes = snapshot.get("window_minutes", QUICK_DELTA_WINDOW_MINUTES)
+        total = total_buy_usd + total_sell_usd
+        sell_skew_pct = (total_sell_usd - total_buy_usd) / total
+        skew_label = "sell" if sell_skew_pct > 0 else "buy"
+        lines.append(
+            f"\U0001f4b5 Last {window_minutes}min volume: buy=${total_buy_usd:,.0f}  sell=${total_sell_usd:,.0f}  "
+            f"({abs(sell_skew_pct):.0%} {skew_label}-skewed)"
+        )
+    lines.append(
         "Not a trade signal -- these are the coins moving hardest WITH the crowd right now, "
         "possible pump/dump continuation candidates if the move keeps running "
-        "(price = current live mark price, for reference only):",
-    ]
+        "(price = current live mark price, for reference only):"
+    )
     leaders = snapshot["leaders"]
+    resisters = snapshot.get("resisters", [])
+    all_symbols = [symbol for symbol, _, _ in leaders + resisters]
     prices = {}
     with ThreadPoolExecutor(max_workers=SCAN_WORKER_COUNT) as pool:
-        futures = {pool.submit(fetch_live_futures_price, symbol): symbol for symbol, _, _ in leaders}
+        futures = {pool.submit(fetch_live_futures_price, symbol): symbol for symbol in all_symbols}
         for future in as_completed(futures):
             symbol = futures[future]
             try:
                 prices[symbol] = future.result()
             except Exception:
                 prices[symbol] = None
-    for symbol, delta, trade_count in leaders:
+    detail = _per_symbol_volume_detail(all_symbols)
+
+    def _format_row(symbol, delta, trade_count):
         price = prices.get(symbol)
         price_str = f"{price:g}" if price is not None else "n/a"
-        lines.append(f"  {symbol:12} delta={delta:+.2f}  trades={trade_count:,}  price={price_str}")
+        row = f"  {symbol:12} delta={delta:+.2f}  trades={trade_count:,}  price={price_str}"
+        d = detail.get(symbol)
+        if d is not None:
+            total = d["buy_usd"] + d["sell_usd"]
+            buy_pct = d["buy_usd"] / total if total > 0 else 0.5
+            aggressor = "buyers" if buy_pct >= 0.5 else "sellers"
+            row += (
+                f"\n      buy=${d['buy_usd']:,.0f}  sell=${d['sell_usd']:,.0f}  "
+                f"({aggressor} {max(buy_pct, 1 - buy_pct):.0%})  range={d['low']:g}-{d['high']:g}"
+            )
+        return row
+
+    for symbol, delta, trade_count in leaders:
+        lines.append(_format_row(symbol, delta, trade_count))
+
+    if resisters:
+        resist_label = "dropping less / climbing" if direction == "bearish" else "lagging behind"
+        lines.append("")
+        lines.append(f"\U0001f6e1 <b>Resisting the move</b> ({resist_label} the {direction} crowd):")
+        for symbol, delta, trade_count in resisters:
+            lines.append(_format_row(symbol, delta, trade_count))
+
     return "\n".join(lines)
 
 

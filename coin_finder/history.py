@@ -68,6 +68,14 @@ def _parse_klines(raw):
             # skewed this candle's volume/delta", which raw volume alone
             # can't distinguish
             "trade_count": int(k[8]),
+            # quote (USD) volume (index 7) and taker buy quote volume
+            # (index 10) -- added 2026-11-22 for market_regime_alert's
+            # market-wide buy/sell USD totals, which need a $ figure
+            # rather than base-asset units (comparing base-asset buy/sell
+            # volume ACROSS different coins is meaningless -- 1 BTC and 1
+            # PEPE aren't comparable amounts).
+            "quote_volume": float(k[7]),
+            "taker_buy_quote_volume": float(k[10]),
         }
         for k in raw
     ]

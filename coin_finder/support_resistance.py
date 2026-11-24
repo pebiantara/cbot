@@ -20,13 +20,23 @@ SR_INTERVALS = (("15m", 96), ("1h", 100), ("4h", 60), ("1d", 90))
 
 
 def support_resistance_for_interval(symbol, interval, lookback):
-    candles = get_futures_klines(symbol, interval, limit=lookback)
-    if len(candles) < 20:
+    """Structural levels (next_key_level, volume_profile) are computed from
+    CLOSED candles only -- the still-forming current candle's high/low/
+    volume keeps changing as price ticks within it, which can shift VAH/
+    VAL/POC and the swing-point trendline fit for reasons that have nothing
+    to do with real structure (same class of bug already fixed for ribbon/
+    VWAP elsewhere in this project, see quick_scalp_signal.py's
+    _quick_candle_confirms -- "use candles[-2], not the still-forming
+    one"). `close` still comes from the forming candle, since that's
+    genuinely the current live price."""
+    candles = get_futures_klines(symbol, interval, limit=lookback + 1)
+    if len(candles) < 21:
         return None
     close = candles[-1]["close"]
-    resistance = next_key_level(candles, is_long=True, lookback=lookback)
-    support = next_key_level(candles, is_long=False, lookback=lookback)
-    vp = volume_profile(candles)
+    closed_candles = candles[:-1]
+    resistance = next_key_level(closed_candles, is_long=True, lookback=lookback)
+    support = next_key_level(closed_candles, is_long=False, lookback=lookback)
+    vp = volume_profile(closed_candles)
     return {"close": close, "resistance": resistance, "support": support, "volume_profile": vp}
 
 

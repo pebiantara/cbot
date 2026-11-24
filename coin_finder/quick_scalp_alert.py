@@ -33,6 +33,34 @@ enough to alert on for real.
 
 Set QUICK_SCALP_POLL_SECONDS to change cadence. Set RUN_ONCE=1 to run
 through one poll and exit (useful for testing).
+
+CHASE confirmation delay + reversal warning (added 2026-11-19 after a data
+analysis this project's conversation history ran against
+quick_scalp_chase_predictions.db's first ~3.5 days: a chase trade that
+hadn't moved >=CHASE_CONFIRM_MOVE_PCT favorably within 5 minutes of
+triggering had roughly HALF the 1h hit rate of one that had (19.2% vs
+38.8%, n=796/484) -- "the candle is still stuck" right after a chase
+alert fires is a real, strong leading indicator of a loss, not noise.
+Separately, a quarter of all chase triggers got contradicted by an
+opposite-direction trigger on the SAME coin within 60 minutes, and when
+that happened the ORIGINAL trigger's hit rate was already roughly half of
+normal (14.0% vs 30.9%) -- a same-coin reversal isn't an independent new
+signal, it's confirmation the first one was already dying.
+
+So: a newly-ready chase trigger no longer alerts immediately. It's held
+in CHASE_PENDING_JSON for CHASE_CONFIRM_DELAY_SECONDS (5min); only if
+price has since moved >=CHASE_CONFIRM_MOVE_PCT (0.05%) in the triggered
+direction does the alert actually go out (using the price/signal at
+confirmation time, not the stale trigger-time snapshot). A trigger that
+flips direction before its own confirmation window elapses overwrites the
+pending entry with the new direction's own fresh clock -- no special-case
+cancellation needed, a flipped setup simply won't confirm in its original
+direction anyway. Separately, CHASE_RECENT_ALERTS_JSON remembers the last
+CONFIRMED alert per symbol for CHASE_REVERSAL_WARNING_WINDOW_SECONDS (1h,
+matching the engine's own longest outcome horizon) -- if a new confirmed
+alert fires in the opposite direction within that window, the message is
+prefixed with an explicit "this looks like it's reversing" warning
+instead of landing as just another unrelated alert.
 """
 
 import json
@@ -64,8 +92,14 @@ from telegram_alert import load_env, send_telegram_message
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATE_JSON = os.path.join(HERE, "quick_scalp_alert_state.json")
 CHASE_STATE_JSON = os.path.join(HERE, "quick_scalp_chase_alert_state.json")
+CHASE_PENDING_JSON = os.path.join(HERE, "quick_scalp_chase_pending_state.json")
+CHASE_RECENT_ALERTS_JSON = os.path.join(HERE, "quick_scalp_chase_recent_alerts_state.json")
 PRO_STATE_JSON = os.path.join(HERE, "quick_scalp_pro_shadow_state.json")
 POLL_INTERVAL_SECONDS = int(os.environ.get("QUICK_SCALP_POLL_SECONDS", 60))
+
+CHASE_CONFIRM_DELAY_SECONDS = int(os.environ.get("CHASE_CONFIRM_DELAY_SECONDS", 300))
+CHASE_CONFIRM_MOVE_PCT = float(os.environ.get("CHASE_CONFIRM_MOVE_PCT", 0.05)) / 100
+CHASE_REVERSAL_WARNING_WINDOW_SECONDS = 3600
 
 
 def _current_universe_delta_map():
@@ -172,7 +206,10 @@ def poll_once_chase(delta_map=None):
     backtest behind this. Same "ready to trade" gating and dedup-on-
     transition pattern as poll_once() above, own state file and own DB
     (quick_scalp_chase_outcomes.py) so it can't collide with the fade
-    engine's tracking."""
+    engine's tracking.
+
+    A newly-ready trigger doesn't alert immediately -- see this module's
+    docstring for the confirmation-delay + reversal-warning rationale."""
     env = load_env()
     token, chat_id = env.get("TELEGRAM_BOT_TOKEN"), env.get("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
@@ -181,7 +218,10 @@ def poll_once_chase(delta_map=None):
     risk_pct = float(env.get("LEVERAGE_RISK_PCT", "1")) / 100
 
     previous = load_state(CHASE_STATE_JSON)
+    pending = load_state(CHASE_PENDING_JSON)
+    recent_alerts = load_state(CHASE_RECENT_ALERTS_JSON)
     signals = scan_quick_scalp_chase_signals(delta_map=delta_map)
+    now = time.time()
 
     new_state = {}
     for symbol, signal in signals.items():
@@ -193,15 +233,54 @@ def poll_once_chase(delta_map=None):
 
         prev = previous.get(symbol)
         prev = prev if isinstance(prev, dict) else {}
-        if ready and (prev.get("direction") != direction or not prev.get("ready")):
-            message = build_quick_scalp_chase_alert_message(
-                symbol, signal, account_equity=account_equity, risk_pct=risk_pct,
+        is_new_trigger = ready and (prev.get("direction") != direction or not prev.get("ready"))
+
+        existing_pending = pending.get(symbol)
+        if is_new_trigger and (not existing_pending or existing_pending.get("direction") != direction):
+            # start (or restart, on a direction flip) this symbol's own confirmation clock
+            pending[symbol] = {"direction": direction, "trigger_price": signal["close_price"], "trigger_time": now}
+
+    for symbol, p in list(pending.items()):
+        if now - p["trigger_time"] < CHASE_CONFIRM_DELAY_SECONDS:
+            continue
+        del pending[symbol]  # resolved either way this poll -- confirmed-and-alerted, or dropped
+        direction = p["direction"]
+        current_signal = signals.get(symbol)
+        if current_signal is None or ("LONG" if current_signal["is_long"] else "SHORT") != direction:
+            continue  # setup evaporated or flipped before confirmation -- nothing to confirm
+        current_price = current_signal["close_price"]
+        signed_move_pct = (current_price - p["trigger_price"]) / p["trigger_price"] * (1 if direction == "LONG" else -1)
+        if signed_move_pct < CHASE_CONFIRM_MOVE_PCT:
+            print(f"[chase] {symbol} {direction} filtered -- stalled at confirmation check "
+                  f"({signed_move_pct:+.3%} vs {CHASE_CONFIRM_MOVE_PCT:+.3%} needed)")
+            continue
+
+        reversal_note = ""
+        prior = recent_alerts.get(symbol)
+        if prior and prior.get("direction") != direction and now - prior.get("alert_time", 0) < CHASE_REVERSAL_WARNING_WINDOW_SECONDS:
+            age_min = (now - prior["alert_time"]) / 60
+            reversal_note = (
+                f"⚠️ <b>Reversal warning:</b> {symbol} {prior['direction']} was alerted "
+                f"{age_min:.0f}min ago -- if that position is still open, this looks like it's "
+                f"reversing now.\n\n"
             )
-            send_telegram_message(message, token, chat_id, parse_mode="HTML")
-            record_signal_chase(symbol, direction, signal["close_price"])
-            print(f"[chase] Alerted (ready to trade): {direction} {symbol}")
+
+        message = reversal_note + build_quick_scalp_chase_alert_message(
+            symbol, current_signal, account_equity=account_equity, risk_pct=risk_pct,
+        )
+        send_telegram_message(message, token, chat_id, parse_mode="HTML")
+        record_signal_chase(symbol, direction, current_price)
+        recent_alerts[symbol] = {"direction": direction, "alert_time": now}
+        print(f"[chase] Alerted (confirmed @ +{CHASE_CONFIRM_DELAY_SECONDS // 60}min): {direction} {symbol}")
+
+    recent_alerts = {
+        s: v for s, v in recent_alerts.items()
+        if now - v.get("alert_time", 0) < CHASE_REVERSAL_WARNING_WINDOW_SECONDS
+    }
 
     save_state(new_state, CHASE_STATE_JSON)
+    save_state(pending, CHASE_PENDING_JSON)
+    save_state(recent_alerts, CHASE_RECENT_ALERTS_JSON)
 
     try:
         resolved = resolve_matured_chase()
@@ -293,10 +372,14 @@ def poll_once_all():
         poll_once_pattern_watch()
     except Exception as e:
         print(f"[pattern watch] poll failed: {e} -- continuing")
-    try:
-        poll_once_market_regime(delta_map=delta_map)
-    except Exception as e:
-        print(f"[market regime] poll failed: {e} -- continuing")
+    # Turned off 2026-11-24 at the user's request -- set
+    # MARKET_REGIME_ALERT_ENABLED=1 to turn it back on. Gated here (not
+    # removed) so re-enabling doesn't need a code change, just an env var.
+    if os.environ.get("MARKET_REGIME_ALERT_ENABLED") == "1":
+        try:
+            poll_once_market_regime(delta_map=delta_map)
+        except Exception as e:
+            print(f"[market regime] poll failed: {e} -- continuing")
     if os.environ.get("QUICK_SCALP_PRO_SHADOW_ENABLED") == "1":
         try:
             poll_once_pro_shadow()

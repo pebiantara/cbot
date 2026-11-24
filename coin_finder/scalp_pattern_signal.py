@@ -94,7 +94,7 @@ from leverage_risk import MAX_PORTFOLIO_ALLOCATION_PCT, maintenance_margin_rate_
 from portfolio_ledger import total_committed_margin
 from scalp_outcomes import recent_alert_count
 from technical import ema, rsi
-from universe import get_universe
+from universe import get_futures_only_universe, get_universe
 
 SCAN_SLEEP_SECONDS = 0.05
 SCALP_INTERVAL = "1h"  # moved from "15m" 2026-11-06, see module docstring
@@ -195,7 +195,16 @@ TP_STRUCTURE_BUFFER_PCT = 0.001
 
 
 def _resolve_symbols(top_n):
-    universe_symbols = [c["symbol"] for c in get_universe()]
+    """Spot universe + futures-only listings (e.g. EVAAUSDT -- never listed
+    on Spot at all, see universe.py's get_futures_only_universe() docstring),
+    merged and re-sorted by volume together so a liquid futures-only name
+    isn't truncated out just for landing at the end of the spot list rather
+    than ranked where its actual volume puts it."""
+    combined = sorted(
+        get_universe() + get_futures_only_universe(),
+        key=lambda c: c["quote_volume_usdt"], reverse=True,
+    )
+    universe_symbols = [c["symbol"] for c in combined]
     rest = [s for s in universe_symbols if s not in PRIORITY_SYMBOLS]
     if top_n:
         return PRIORITY_SYMBOLS + rest[:max(0, top_n - len(PRIORITY_SYMBOLS))]
